@@ -29,7 +29,7 @@ echo
 # Setup Python environment with uv
 # =============================================================================
 
-echo "[1/3] Setting up Python environment..."
+echo "[1/4] Setting up Python environment..."
 
 export PATH="$HOME/.local/bin:$PATH"
 
@@ -49,7 +49,7 @@ echo "Done."
 # Setup data directories and extract archives
 # =============================================================================
 
-echo "[2/3] Setting up data..."
+echo "[2/4] Setting up data..."
 mkdir -p "$DATA_DIR"
 mkdir -p "$CODE_DIR/checkpoints"
 mkdir -p "$CODE_DIR/results"
@@ -85,10 +85,33 @@ done
 echo "Done."
 
 # =============================================================================
+# Download checkpoints from Hugging Face
+# =============================================================================
+
+echo "[3/4] Downloading model checkpoints from Hugging Face..."
+CHECKPOINTS_DIR="$CODE_DIR/checkpoints"
+
+if [ -d "$CHECKPOINTS_DIR" ] && [ "$(ls -A "$CHECKPOINTS_DIR" 2>/dev/null)" ]; then
+    echo "  [OK] Checkpoints directory already exists and is not empty"
+else
+    echo "  [>>] Downloading checkpoints from anonymous-tct-authors/tct-models..."
+    uv run python -c "
+from huggingface_hub import snapshot_download
+snapshot_download(
+    repo_id='anonymous-tct-authors/tct-models',
+    repo_type='model',
+    local_dir='$CHECKPOINTS_DIR'
+)
+print('Done.')
+"
+fi
+echo "Done."
+
+# =============================================================================
 # Verification
 # =============================================================================
 
-echo "[3/3] Verifying installation..."
+echo "[4/4] Verifying installation..."
 echo
 echo "============================================================"
 echo "Setup Verification"
