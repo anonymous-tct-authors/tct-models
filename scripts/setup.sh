@@ -91,20 +91,16 @@ echo "Done."
 echo "[3/4] Downloading model checkpoints from Hugging Face..."
 CHECKPOINTS_DIR="$CODE_DIR/checkpoints"
 
-if [ -d "$CHECKPOINTS_DIR" ] && [ "$(ls -A "$CHECKPOINTS_DIR" 2>/dev/null)" ]; then
-    echo "  [OK] Checkpoints directory already exists and is not empty"
-else
-    echo "  [>>] Downloading checkpoints from anonymous-tct-authors/tct-models..."
-    uv run python -c "
+echo "  [>>] Syncing checkpoints from anonymous-tct-authors/tct-models..."
+uv run python -c "
 from huggingface_hub import snapshot_download
 snapshot_download(
     repo_id='anonymous-tct-authors/tct-models',
     repo_type='model',
     local_dir='$CHECKPOINTS_DIR'
 )
-print('Done.')
+print('  [OK] Checkpoints synced.')
 "
-fi
 echo "Done."
 
 # =============================================================================
