@@ -1,0 +1,724 @@
+#!/usr/bin/env python3
+"""
+Unified Training Script for TCT Experiments
+
+Train language models on pre-encoded JSONL data for any schema and tokenizer.
+Works with both TCT-BPE and UTF8-BPE tokenized data (same JSONL format).
+
+Usage:
+    # Train TCT-BPE on kubernetes
+    python -m scripts.train_unified --schema kubernetes --tokenizer tct --model_size small
+
+    # Train UTF8-BPE on eslintrc
+    python -m scripts.train_unified --schema eslintrc --tokenizer utf8 --model_size small
+
+    # Distributed training
+    torchrun --nproc_per_node=8 -m scripts.train_unified --schema kubernetes --tokenizer tct
+
+Configuration loaded from configs/ module:
+    - Schema config (vocab size, context length, data paths)
+    - Model config (architecture, training hyperparameters)
+"""
+
+import os
+# Memory management settings - must be set before importing torch
+# Note: PYTORCH_CUDA_ALLOC_CONF is deprecated, use PYTORCH_ALLOC_CONF
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.8"
+# Clear inductor cache on startup to avoid stale compiled graphs causing OOM
+os.environ["TORCHINDUCTOR_CACHE_DIR"] = "/tmp/torchinductor_cache"
+
+import gc
+import math
+import shutil
+import json
+import sys
+import time
+import itertools
+from pathlib import Path
+from contextlib import nullcontext
+
+import torch
+
+# Aggressive GPU cleanup at startup - clear any stale allocations from previous runs
+if torch.cuda.is_available():
+    # Check initial GPU state
+    free_mem, total_mem = torch.cuda.mem_get_info()
+    print(f"[STARTUP] GPU memory: {free_mem/1e9:.2f}GB free / {total_mem/1e9:.2f}GB total")
+    if free_mem < total_mem * 0.5:
+        print(f"[WARNING] Less than 50% GPU memory free at startup!")
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    gc.collect()
+    # Check again after cleanup
+    free_mem2, _ = torch.cuda.mem_get_info()
+    if free_mem2 > free_mem:
+        print(f"[STARTUP] Freed {(free_mem2-free_mem)/1e9:.2f}GB via cleanup")
+
+# Add project root to path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from nanochat.gpt import GPT, GPTConfig
+from nanochat.common import compute_init, compute_cleanup, print0, print_banner, autodetect_device_type
+from nanochat.jsonl_dataloader import (
+    create_dataloader,
+    create_reshuffled_dataloaders,
+    get_epoch_steps,
+    get_warmup_steps,
+)
+from configs import (
+    get_schema_config,
+    get_model_config,
+)
+
+print_banner()
+
+# -----------------------------------------------------------------------------
+# User settings (can be overridden via CLI)
+device_type = ""        # cuda|cpu|mps (empty => autodetect)
+schema = "kubernetes"   # tsconfig, eslintrc, kubernetes
+tokenizer = "tct"       # tct or utf8
+model_size = "small"    # small, medium, large
+epochs = None           # None => use schema default
+data_root = None        # None => ./data (project local)
+model_tag = ""          # optional tag for checkpoint directory
+checkpoint_base = None  # None => use CHECKPOINT_DIR env var, or "checkpoints"
+warmup_fraction = 0.05  # warmup as fraction of first epoch
+grad_clip = 1.0         # gradient clipping
+device_batch_size = None  # None => use config default
+gradient_accumulation_override = None  # None => use config default
+eff_batch = None          # None => use config default (64), or override effective batch size
+lr_schedule = None        # None => use config default (cosine), or "constant"/"cosine"
+dropout = 0.2           # dropout for regularization (combined with batch 64)
+learning_rate_override = None  # None => use config default, or e.g. 3e-4
+resume_from_epoch = 0   # resume training from this epoch (0 = start fresh)
+eval_every_epoch = 1    # evaluate every N epochs
+# Muon optimizer settings (from nanochat, validated by Essential AI 2025)
+# Muon is batch-size robust - no LR scaling needed (arxiv.org/abs/2505.02222)
+# AdamW LRs are scaled by 1/sqrt(d_model/768) in setup_optimizers() (muP principle)
+use_muon = True         # use Muon for transformer layers, AdamW for embeddings
+matrix_lr = 0.02        # learning rate for transformer layers (Muon) - batch invariant
+embedding_lr = 0.2      # learning rate for token embeddings (AdamW)
+unembedding_lr = 0.004  # learning rate for lm_head (AdamW)
+scale_lr_by_batch = False  # optional: scale AdamW LRs by sqrt(batch/524K)
+save_every_pct = None  # None => 5% for tiny/mini/base, 10% for small+ (override with CLI)
+num_eval_batches = 100  # number of batches for validation
+reshuffle_data = True   # reshuffle train+val data randomly (fixes sequential split)
+gradient_checkpointing = False  # trade compute for memory (enable with --gradient_checkpointing=True)
+use_torch_compile = True        # disable with --use_torch_compile=False for debugging OOM
+compile_mode = "default"        # "default", "reduce-overhead", or "max-autotune" (slower compile, faster run)
+
+# CLI override
+config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str, type(None)))]
+exec(open(os.path.join('nanochat', 'configurator.py')).read())
+user_config = {k: globals()[k] for k in config_keys}
+
+# Checkpoint directory (local to project)
+code_dir = Path(__file__).parent.parent
+if checkpoint_base is None:
+    checkpoint_base = code_dir / "checkpoints"
+checkpoint_base = Path(checkpoint_base)
+all_checkpoint_bases = [checkpoint_base]
+# -----------------------------------------------------------------------------
+
+# Load schema config
+schema_cfg = get_schema_config(schema, data_root)
+
+# Select tokenizer-specific settings
+if tokenizer == "tct":
+    data_path = schema_cfg["data_path_tct"]
+    partner_data_path = schema_cfg.get("data_path_utf8")
+elif tokenizer == "utf8":
+    data_path = schema_cfg["data_path_utf8"]
+    partner_data_path = schema_cfg.get("data_path_tct")
+else:
+    raise ValueError(f"Unknown tokenizer: '{tokenizer}'. Use 'tct' or 'utf8'")
+
+# Read vocab size from data metadata
+metadata_path = data_path / "metadata.json"
+if metadata_path.exists():
+    with open(metadata_path) as f:
+        metadata = json.load(f)
+    vocab_size = metadata.get("base_vocab_size", 0) + 1  # +1 for pad token
+else:
+    # Fallback to schema config
+    vocab_size = schema_cfg[f"{tokenizer}_vocab_size"]
+
+context_size = schema_cfg["context_size"]
+base_epochs = epochs if epochs is not None else schema_cfg["default_epochs"]
+train_tokens = schema_cfg.get(f"train_tokens_{tokenizer}", schema_cfg["train_tokens_tct"])
+
+# Load model config (pass base_epochs, will apply multiplier inside)
+model_cfg = get_model_config(model_size, vocab_size, context_size, base_epochs)
+
+# Apply epochs multiplier if present (e.g., small-long uses 2x epochs)
+epochs_multiplier = model_cfg.get("epochs_multiplier", 1)
+num_epochs = int(base_epochs * epochs_multiplier)
+
+# Compute init
+device_type = autodetect_device_type() if device_type == "" else device_type
+ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
+master_process = ddp_rank == 0
+autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type == "cuda" else nullcontext()
+synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
+get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
+
+# Training parameters
+B = device_batch_size if device_batch_size is not None else model_cfg["batch_size"]
+T = context_size
+# Calculate gradient accumulation: explicit override > eff_batch > config default
+if gradient_accumulation_override is not None:
+    grad_accum = gradient_accumulation_override
+elif eff_batch is not None:
+    grad_accum = max(1, eff_batch // B)
+else:
+    grad_accum = model_cfg["gradient_accumulation"]
+
+# Effective batch size (for logging)
+actual_eff_batch = B * grad_accum * ddp_world_size
+weight_decay = model_cfg["weight_decay"]
+beta1 = model_cfg["beta1"]
+beta2 = model_cfg["beta2"]
+
+# Calculate training steps
+steps_per_epoch = get_epoch_steps(train_tokens, T, B, grad_accum, ddp_world_size)
+total_steps = steps_per_epoch * num_epochs
+warmup_steps = get_warmup_steps(train_tokens, T, B, grad_accum, ddp_world_size, warmup_fraction)
+
+# Checkpoint frequency: 5% for tiny/mini/base (more checkpoints), 10% for small+ (fewer)
+if save_every_pct is None:
+    save_every_pct = 5 if model_size in ["tiny", "mini", "base"] else 10
+save_interval = max(1, total_steps * save_every_pct // 100)
+
+print0("=" * 80)
+print0(f"EXPERIMENT: {schema} / {tokenizer}-BPE / {model_size}")
+print0("=" * 80)
+print0(f"Schema: {schema}")
+print0(f"Tokenizer: {tokenizer}-BPE")
+print0(f"Data path: {data_path}")
+print0(f"Vocab size: {vocab_size:,}")
+print0(f"Context size: {T}")
+print0(f"Model size: {model_size} ({model_cfg['estimated_params']:,} params)")
+dropout_effective = dropout if dropout is not None else model_cfg.get("dropout", 0.0)
+print0(f"Dropout: {dropout_effective}")
+print0()
+print0(f"Batch size: {B}")
+print0(f"Gradient accumulation: {grad_accum}")
+print0(f"Effective batch size: {B * grad_accum * ddp_world_size}")
+lr_sched_effective = lr_schedule if lr_schedule else model_cfg.get("lr_schedule", "constant")
+print0(f"LR schedule: {lr_sched_effective}")
+print0()
+print0(f"Epochs: {num_epochs}")
+print0(f"Steps per epoch: {steps_per_epoch}")
+print0(f"Total steps: {total_steps}")
+print0(f"Warmup steps: {warmup_steps}")
+print0(f"Save interval: every {save_interval} steps ({save_every_pct}%)")
+print0()
+print0(f"Checkpoint dir: {checkpoint_base}")
+print0()
+
+# Initialize model
+# Gradient checkpointing: trades ~4% speed for ~50% memory savings
+# Disabled by default for speed; enable with --gradient_checkpointing=True if OOM during training
+use_grad_checkpoint = gradient_checkpointing
+if use_grad_checkpoint:
+    print0("Gradient checkpointing: ENABLED (saves memory, ~4% slower)")
+else:
+    print0("Gradient checkpointing: disabled (use --gradient_checkpointing=True if OOM)")
+
+model_config_kwargs = dict(
+    sequence_len=T,
+    vocab_size=vocab_size,
+    n_layer=model_cfg["n_layers"],
+    n_head=model_cfg["n_heads"],
+    n_kv_head=model_cfg["n_heads"],
+    n_embd=model_cfg["d_model"],
+    dropout=dropout_effective,
+    use_swiglu=model_cfg.get("use_swiglu", False),
+    ffn_mult=model_cfg.get("ffn_mult", 4.0),
+    gradient_checkpointing=use_grad_checkpoint,
+)
+
+with torch.device("meta"):
+    gpt_config = GPTConfig(**model_config_kwargs)
+    model = GPT(gpt_config)
+
+model.to_empty(device=device)
+model.init_weights()
+
+# Resume from checkpoint if specified
+start_step = 0
+resumed_checkpoint = None  # Will hold checkpoint data for optimizer/state restoration
+resumed_min_val_loss = float("inf")
+resumed_smooth_train_loss = 0
+
+if resume_from_epoch > 0:
+    checkpoint_dir = checkpoint_base / (model_tag if model_tag else f"{schema}_{tokenizer}_{model_size}")
+    checkpoint_path = checkpoint_dir / f"epoch_{resume_from_epoch:03d}.pt"
+    if checkpoint_path.exists():
+        print0(f"Resuming from checkpoint: {checkpoint_path}")
+        checkpoint_data = torch.load(checkpoint_path, map_location=device)
+
+        # Handle both old format (just state_dict) and new format (full checkpoint)
+        if "model_state_dict" in checkpoint_data:
+            # New format with optimizer state
+            model.load_state_dict(checkpoint_data["model_state_dict"])
+            start_step = checkpoint_data.get("step", resume_from_epoch * steps_per_epoch)
+            resumed_min_val_loss = checkpoint_data.get("min_val_loss", float("inf"))
+            resumed_smooth_train_loss = checkpoint_data.get("smooth_train_loss", 0)
+            resumed_checkpoint = checkpoint_data  # Save for optimizer restoration later
+            print0(f"  Restored step {start_step}, min_val_loss {resumed_min_val_loss:.4f}")
+        else:
+            # Old format (just model weights)
+            model.load_state_dict(checkpoint_data)
+            start_step = resume_from_epoch * steps_per_epoch
+            print0(f"  Old checkpoint format (no optimizer state)")
+
+        # Don't delete checkpoint_data yet - we need it for optimizer state
+        gc.collect()
+        if device_type == "cuda":
+            torch.cuda.empty_cache()
+    else:
+        print0(f"Checkpoint not found: {checkpoint_path}")
+        sys.exit(1)
+
+# Aggressive memory cleanup before torch.compile to prevent OOM during graph compilation
+# This is critical for stable runs, especially on resume
+gc.collect()
+if device_type == "cuda":
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    torch.cuda.synchronize()
+    # Clear stale inductor cache for larger models (OOM risk from stale cache)
+    # Keep cache for tiny/mini/base (faster startup, lower OOM risk)
+    if model_size not in ["tiny", "mini", "base"]:
+        inductor_cache = Path("/tmp/torchinductor_cache")
+        if inductor_cache.exists():
+            try:
+                shutil.rmtree(inductor_cache)
+                print0("Cleared torch inductor cache (large model)")
+            except Exception as e:
+                print0(f"Warning: Could not clear inductor cache: {e}")
+
+orig_model = model
+if use_torch_compile:
+    compile_kwargs = {"dynamic": False}
+    if compile_mode != "default":
+        compile_kwargs["mode"] = compile_mode
+    print0(f"Compiling model with torch.compile (mode={compile_mode})...")
+    model = torch.compile(model, **compile_kwargs)
+    print0("Model compilation complete")
+else:
+    print0("torch.compile DISABLED (use --use_torch_compile=True to enable)")
+
+num_params = sum(p.numel() for p in model.parameters())
+print0(f"Number of parameters: {num_params:,}")
+
+# Initialize optimizer(s)
+if use_muon:
+    # Muon for transformer layers, AdamW for embeddings (original nanochat setup)
+    # Reference: Essential AI (2025) shows Muon is batch-size robust
+    d_model = model_cfg["d_model"]
+    dmodel_lr_scale = (d_model / 768) ** -0.5  # muP scaling for d_model
+
+    # Optional: scale AdamW LRs by sqrt(batch/524K) for smaller batches
+    # Muon LR is NOT scaled (batch-invariant by design)
+    effective_embedding_lr = embedding_lr
+    effective_unembedding_lr = unembedding_lr
+    if scale_lr_by_batch:
+        token_batch = B * T * grad_accum * ddp_world_size
+        adamw_batch_scale = math.sqrt(token_batch / 524288)
+        effective_embedding_lr *= adamw_batch_scale
+        effective_unembedding_lr *= adamw_batch_scale
+        print0(f"Optimizer: Muon + AdamW (batch LR scale: {adamw_batch_scale:.4f})")
+    else:
+        print0(f"Optimizer: Muon + AdamW")
+
+    print0(f"  d_model LR scale: {dmodel_lr_scale:.4f}")
+    print0(f"  Muon LR (transformer): {matrix_lr} (batch-invariant)")
+    print0(f"  AdamW LR (embeddings): {effective_embedding_lr * dmodel_lr_scale:.6f}")
+    print0(f"  AdamW LR (lm_head): {effective_unembedding_lr * dmodel_lr_scale:.6f}")
+    optimizers = orig_model.setup_optimizers(
+        unembedding_lr=effective_unembedding_lr,
+        embedding_lr=effective_embedding_lr,
+        matrix_lr=matrix_lr,
+        weight_decay=weight_decay,
+    )
+    adamw_optimizer, muon_optimizer = optimizers
+else:
+    # Plain AdamW for all parameters (simpler, for comparison)
+    # Calculate learning rate with sqrt scaling for batch size
+    REFERENCE_BATCH = 64  # LR values in config are calibrated for this batch size
+    base_lr = model_cfg["learning_rate"]
+    if learning_rate_override is not None:
+        learning_rate = learning_rate_override
+    elif actual_eff_batch != REFERENCE_BATCH:
+        scale = math.sqrt(actual_eff_batch / REFERENCE_BATCH)
+        learning_rate = base_lr * scale
+    else:
+        learning_rate = base_lr
+
+    print0(f"Optimizer: AdamW (all params, lr={learning_rate:.2e})")
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=learning_rate,
+        betas=(beta1, beta2),
+        weight_decay=weight_decay,
+    )
+    optimizers = [optimizer]
+
+# Restore optimizer state if resuming with new checkpoint format
+if resumed_checkpoint is not None and "optimizer_state_dict" in resumed_checkpoint:
+    print0("Restoring optimizer state...")
+    opt_states = resumed_checkpoint["optimizer_state_dict"]
+    if isinstance(opt_states, list):
+        # New format: list of optimizer states
+        for opt, state in zip(optimizers, opt_states):
+            opt.load_state_dict(state)
+    else:
+        # Old format: single optimizer state (only works with use_muon=False)
+        if not use_muon:
+            optimizers[0].load_state_dict(opt_states)
+        else:
+            print0("  Warning: Old checkpoint format, cannot restore Muon optimizer state")
+    print0("  Optimizer state restored")
+    # Clean up checkpoint data now that we're done with it
+    del resumed_checkpoint
+    gc.collect()
+    if device_type == "cuda":
+        torch.cuda.empty_cache()
+
+# Initialize dataloaders
+print0("\nInitializing dataloaders...")
+if reshuffle_data:
+    print0("Reshuffling data (combining train+val, random split)...")
+    train_loader, val_loader_static = create_reshuffled_dataloaders(
+        data_dir=data_path,
+        context_size=T,
+        batch_size=B,
+        train_ratio=0.95,
+        max_len=T,  # Filter sequences exceeding context window
+        partner_data_dir=partner_data_path,  # Coordinated filtering with partner tokenizer
+        device=device,
+        verbose=master_process,
+        seed=42,
+    )
+
+    def build_val_loader():
+        return val_loader_static
+else:
+    train_loader = create_dataloader(
+        data_dir=data_path,
+        context_size=T,
+        batch_size=B,
+        split="train",
+        device=device,
+        shuffle=True,
+        verbose=master_process,
+    )
+
+    def build_val_loader():
+        return create_dataloader(
+            data_dir=data_path,
+            context_size=T,
+            batch_size=B,
+            split="val",
+            device=device,
+            shuffle=False,
+            verbose=False,
+        )
+
+# Create infinite iterator
+train_iter = itertools.cycle(train_loader)
+
+# Prefetch first batch
+x, y = next(train_iter)
+print0(f"First batch shape: x={x.shape}, y={y.shape}")
+print0()
+
+# Learning rate scheduler
+lr_schedule_actual = lr_schedule if lr_schedule else model_cfg.get("lr_schedule", "constant")
+
+def get_lr_multiplier(step):
+    """Get LR multiplier (0 to 1) for the given step. Applied to all optimizers."""
+    # Warmup phase
+    if step < warmup_steps:
+        return (step + 1) / warmup_steps
+    # After warmup: constant or cosine decay
+    if lr_schedule_actual == "constant":
+        return 1.0
+    # Cosine decay phase (decay to 10% of max)
+    progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+    return 0.1 + 0.5 * 0.9 * (1 + math.cos(math.pi * progress))
+
+def get_muon_momentum(step):
+    """Momentum scheduler for Muon - ramps from 0.85 to 0.95 over first 300 steps."""
+    frac = min(step / 300, 1)
+    return (1 - frac) * 0.85 + frac * 0.95
+
+# Checkpoint saving - includes optimizer state for proper resume
+# REDUNDANT SAVING: saves to ALL available locations to prevent data loss from silent filesystem failures
+def save_checkpoint(step, epoch, val_loss, min_val_loss_current, smooth_train_loss_current):
+    if not master_process:
+        return
+
+    output_dirname = model_tag if model_tag else f"{schema}_{tokenizer}_{model_size}"
+
+    # Prepare checkpoint data once
+    checkpoint_data = {
+        "model_state_dict": orig_model.state_dict(),
+        "optimizer_state_dict": [opt.state_dict() for opt in optimizers],
+        "step": step,
+        "epoch": epoch,
+        "val_loss": val_loss,
+        "min_val_loss": min_val_loss_current,
+        "smooth_train_loss": smooth_train_loss_current,
+        "use_muon": use_muon,
+    }
+
+    config_data = {
+        "schema": schema,
+        "tokenizer": tokenizer,
+        "model_size": model_size,
+        "epoch": epoch,
+        "step": step,
+        "val_loss": val_loss,
+        "model_config": model_config_kwargs,
+        "schema_config": {k: str(v) if isinstance(v, Path) else v for k, v in schema_cfg.items()},
+        "user_config": user_config,
+    }
+
+    # Save to ALL available checkpoint locations for redundancy
+    saved_locations = []
+    failed_locations = []
+
+    for ckpt_base in all_checkpoint_bases:
+        try:
+            checkpoint_dir = ckpt_base / output_dirname
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+            # Save checkpoint with explicit flush
+            checkpoint_path = checkpoint_dir / f"epoch_{epoch:03d}.pt"
+            torch.save(checkpoint_data, checkpoint_path)
+
+            # Force sync to disk (prevents NFS caching issues)
+            with open(checkpoint_path, 'rb') as f:
+                os.fsync(f.fileno())
+
+            # Verify file was actually written
+            if not checkpoint_path.exists() or checkpoint_path.stat().st_size == 0:
+                raise IOError(f"File not written or empty: {checkpoint_path}")
+
+            # Note: best.pt is now saved immediately when new best is found (in main training loop)
+            # This ensures best.pt is always up-to-date, not just when checkpoint interval coincides
+
+            # Save config
+            config_path = checkpoint_dir / "config.json"
+            with open(config_path, 'w') as f:
+                json.dump(config_data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+
+            saved_locations.append(str(checkpoint_dir))
+
+        except Exception as e:
+            failed_locations.append(f"{ckpt_base}: {e}")
+
+    # Report results
+    if saved_locations:
+        print0(f"Checkpoint saved to {len(saved_locations)} location(s): {saved_locations[0]}")
+        for loc in saved_locations[1:]:
+            print0(f"  + backup: {loc}")
+    else:
+        print0(f"ERROR: Failed to save checkpoint to ANY location!")
+        for fail in failed_locations:
+            print0(f"  - {fail}")
+
+    if failed_locations and saved_locations:
+        print0(f"  WARNING: Failed to save to {len(failed_locations)} backup location(s)")
+
+# Validation
+@torch.no_grad()
+def evaluate():
+    model.eval()
+    val_loader = build_val_loader()
+    val_iter = iter(val_loader)
+    total_loss = 0.0
+    actual_batches = 0
+
+    for _ in range(num_eval_batches):
+        try:
+            x_val, y_val = next(val_iter)
+            with autocast_ctx:
+                loss = model(x_val, y_val)
+            total_loss += loss.item()
+            actual_batches += 1
+        except StopIteration:
+            break
+
+    avg_loss = total_loss / actual_batches if actual_batches > 0 else 0.0
+    model.train()
+
+    del val_loader, val_iter
+    gc.collect()
+    if device_type == "cuda":
+        torch.cuda.empty_cache()
+
+    return avg_loss
+
+# -----------------------------------------------------------------------------
+# Training loop
+print0("=" * 80)
+if resume_from_epoch > 0:
+    print0(f"RESUMING TRAINING from epoch {resume_from_epoch} (step {start_step})")
+else:
+    print0("STARTING TRAINING")
+print0("=" * 80)
+print0()
+
+# Use resumed values if available, otherwise start fresh
+min_val_loss = resumed_min_val_loss
+smooth_train_loss = resumed_smooth_train_loss
+ema_beta = 0.9
+total_training_time = 0
+is_best = False  # Track if current checkpoint is best (set during eval)
+
+for step in range(start_step, total_steps + 1):
+    current_epoch = step // steps_per_epoch
+    epoch_step = step % steps_per_epoch
+    last_step = step == total_steps
+
+    # Evaluation at epoch boundaries
+    is_best = False  # Reset for this step
+    if last_step or (epoch_step == 0 and current_epoch > 0 and current_epoch % eval_every_epoch == 0):
+        val_loss = evaluate()
+        val_ppl = torch.exp(torch.tensor(val_loss)).item()
+        is_best = val_loss < min_val_loss
+        if is_best:
+            min_val_loss = val_loss
+        print0(f"Epoch {current_epoch:3d} | Step {step:6d} | Val loss: {val_loss:.4f} | Val ppl: {val_ppl:.2f}" +
+               (" (best)" if is_best else ""))
+
+        # Save best.pt immediately when new best is found (independent of checkpoint interval)
+        # This fixes the bug where best.pt was only updated when checkpoint save coincided with new best
+        if is_best and master_process:
+            output_dirname = model_tag if model_tag else f"{schema}_{tokenizer}_{model_size}"
+            for ckpt_base in all_checkpoint_bases:
+                try:
+                    best_path = ckpt_base / output_dirname / "best.pt"
+                    best_path.parent.mkdir(parents=True, exist_ok=True)
+                    torch.save(orig_model.state_dict(), best_path)
+                    with open(best_path, 'rb') as f:
+                        os.fsync(f.fileno())
+                except Exception:
+                    pass  # Will be saved properly at next checkpoint interval
+            print0(f"  New best model saved!")
+
+    # Checkpointing at intervals (best.pt is saved immediately above when is_best=True)
+    if master_process and (last_step or (step > 0 and step % save_interval == 0)):
+        save_checkpoint(
+            step=step,
+            epoch=current_epoch,
+            val_loss=val_loss if 'val_loss' in locals() else 0.0,
+            min_val_loss_current=min_val_loss,
+            smooth_train_loss_current=smooth_train_loss,
+        )
+
+    if last_step:
+        break
+
+    # Training step
+    # Mark CUDA graph step boundary to prevent tensor overwrite errors with torch.compile
+    if use_torch_compile and device_type == "cuda":
+        torch.compiler.cudagraph_mark_step_begin()
+    synchronize()
+    t0 = time.time()
+
+    # Gradient accumulation
+    for micro_step in range(grad_accum):
+        with autocast_ctx:
+            loss = model(x, y)
+
+        train_loss = loss.detach()
+        loss = loss / grad_accum
+        loss.backward()
+
+        x, y = next(train_iter)
+
+    # Gradient clipping
+    if grad_clip > 0.0:
+        torch.nn.utils.clip_grad_norm_(orig_model.parameters(), grad_clip)
+
+    # Optimizer step - update LR for all optimizers, momentum for Muon
+    lrm = get_lr_multiplier(step)
+    for opt in optimizers:
+        for group in opt.param_groups:
+            group["lr"] = group["initial_lr"] * lrm
+    if use_muon:
+        muon_momentum = get_muon_momentum(step)
+        for group in muon_optimizer.param_groups:
+            group["momentum"] = muon_momentum
+
+    for opt in optimizers:
+        opt.step()
+    model.zero_grad(set_to_none=True)
+
+    synchronize()
+    t1 = time.time()
+    dt = t1 - t0
+
+    # Logging
+    smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss.item()
+    debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step - start_step + 1))
+
+    if step > start_step + 10:
+        total_training_time += dt
+
+    # Get current LR for logging (use first optimizer's first group as representative)
+    current_lr = optimizers[0].param_groups[0]["lr"]
+
+    if step % 10 == 0:
+        pct_done = 100 * step / total_steps
+        tok_per_sec = int(B * T * grad_accum * ddp_world_size / dt)
+        train_ppl = torch.exp(torch.tensor(debiased_smooth_loss)).item()
+        print0(f"E{current_epoch:02d} step {step:06d}/{total_steps:06d} ({pct_done:.1f}%) | "
+               f"loss: {debiased_smooth_loss:.4f} | ppl: {train_ppl:.1f} | "
+               f"lr: {current_lr:.2e} | dt: {dt*1000:.0f}ms | tok/s: {tok_per_sec:,}")
+
+    # Periodic memory cleanup to prevent fragmentation
+    if step % 1000 == 0 and device_type == "cuda":
+        torch.cuda.empty_cache()
+
+print0()
+print0("=" * 80)
+print0("TRAINING COMPLETE")
+print0("=" * 80)
+print0(f"Schema: {schema}")
+print0(f"Tokenizer: {tokenizer}-BPE")
+print0(f"Model: {model_size}")
+print0(f"Peak memory: {get_max_memory() / 1024 / 1024:.0f}MiB")
+print0(f"Total time: {total_training_time/60:.1f}m ({total_training_time/3600:.2f}h)")
+print0(f"Min val loss: {min_val_loss:.4f}")
+print0()
+
+# Write completion marker to ALL checkpoint locations (used by train.sh to detect finished experiments)
+if master_process:
+    output_dirname = model_tag if model_tag else f"{schema}_{tokenizer}_{model_size}"
+    marker_text = f"Training completed at step {total_steps}, min_val_loss={min_val_loss:.4f}\n"
+    for ckpt_base in all_checkpoint_bases:
+        try:
+            complete_marker = ckpt_base / output_dirname / "COMPLETE"
+            complete_marker.write_text(marker_text)
+            # Force sync
+            with open(complete_marker, 'r') as f:
+                os.fsync(f.fileno())
+            print0(f"Completion marker: {complete_marker}")
+        except Exception as e:
+            print0(f"  WARNING: Failed to write completion marker to {ckpt_base}: {e}")
+
+# Cleanup
+del model, orig_model, optimizers, train_loader
+gc.collect()
+if device_type == "cuda":
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+compute_cleanup()

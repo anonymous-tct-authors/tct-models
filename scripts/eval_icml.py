@@ -1,0 +1,3019 @@
+#!/usr/bin/env python3
+"""
+ICML 2026 Evaluation Script: TCT vs BPE+XGrammar
+
+Runs evaluation metrics:
+1. BPB (Bits-per-Byte) - Information-theoretic comparison with XGrammar masking
+2. Generation Quality - Field value distribution comparison
+
+Usage:
+    # Auto-detect checkpoints (new simplified interface)
+    python -m scripts.eval_icml \
+        --schema kubernetes \
+        --model_size mini \
+        --num_samples 1000 \
+        --output results/icml/kubernetes_mini.json
+
+    # Manual checkpoint paths (old interface, still supported)
+    python -m scripts.eval_icml \
+        --schema kubernetes \
+        --tct_checkpoint checkpoints/kubernetes_tct_small/ \
+        --utf8_checkpoint checkpoints/kubernetes_utf8_small/ \
+        --num_samples 1000 \
+        --output results/icml/kubernetes.json
+
+    # BPB only (faster)
+    python -m scripts.eval_icml \
+        --schema kubernetes \
+        --model_size mini \
+        --bpb_only \
+        --output results/icml/kubernetes_bpb.json
+
+    # Generation quality only
+    python -m scripts.eval_icml \
+        --schema kubernetes \
+        --model_size mini \
+        --generation_only \
+        --output results/icml/kubernetes_gen.json
+"""
+
+import argparse
+import gc
+import json
+import logging
+import psutil
+import re
+import sys
+import time
+from dataclasses import asdict
+from datetime import datetime
+from pathlib import Path
+import torch
+
+
+def cleanup_gpu_memory():
+    """Force cleanup of GPU memory after batch processing.
+
+    This is critical to prevent OOM errors across batches. We delete common
+    tensor variables that may be holding GPU memory and force CUDA cache clear.
+    """
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+from typing import Any, Dict, List, Optional
+
+# Add project root to path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+
+def setup_logging(output_path: Optional[Path] = None) -> Path:
+    """Set up logging to both console and file.
+
+    Returns the log file path.
+    """
+    # Create log filename based on output path or timestamp
+    if output_path:
+        log_path = output_path.with_suffix('.log')
+    else:
+        log_dir = Path("results")
+        log_dir.mkdir(exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_path = log_dir / f"eval_{timestamp}.log"
+
+    # Configure logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s | %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+        handlers=[
+            logging.FileHandler(log_path),
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
+
+    return log_path
+
+
+def log(msg: str):
+    """Log message to both console and file."""
+    logging.info(msg)
+
+
+def compute_generation_batch_size(model, max_tokens: int, verbose: bool = False) -> int:
+    """Compute optimal batch size for generation based on model size and GPU memory.
+
+    Uses similar approach to training batch sizing in configs/model_configs.py:
+    - Reference batch sizes for 24GB VRAM
+    - Scale proportionally to actual GPU memory
+    - Account for KV-cache memory growth during generation
+
+    Formula:
+        KV-cache per sample = 2 * n_layers * seq_len * n_kv_heads * head_dim * 4 bytes
+        Available = GPU_memory - model_weights - safety_margin
+        max_batch = Available / KV_cache_per_sample
+
+    Args:
+        model: The GPT model (to get config and device)
+        max_tokens: Maximum sequence length for generation
+        verbose: Print calculation details
+
+    Returns:
+        Optimal batch size (power of 2, min 1, max 512)
+    """
+    import torch
+
+    cfg = model.config
+    device = next(model.parameters()).device
+
+    # Get GPU memory
+    if device.type == "cuda":
+        gpu_memory = torch.cuda.get_device_properties(device).total_memory
+        # Get current allocated memory
+        allocated = torch.cuda.memory_allocated(device)
+    else:
+        # CPU fallback - use reasonable batch size
+        return 16
+
+    # Calculate model memory (already allocated)
+    model_params = sum(p.numel() * p.element_size() for p in model.parameters())
+
+    # Calculate KV-cache memory per sample
+    # KV cache shape: [n_layers, 2, batch, n_kv_heads, seq_len, head_dim]
+    # Each entry is float32 (4 bytes)
+    head_dim = cfg.n_embd // cfg.n_head
+    kv_cache_per_sample = (
+        2  # K and V
+        * cfg.n_layer
+        * cfg.n_kv_head
+        * max_tokens
+        * head_dim
+        * 4  # bytes per float32
+    )
+
+    # Available memory for KV-cache (leave 10% headroom for activations/overhead)
+    safety_factor = 0.9
+    available = (gpu_memory - allocated) * safety_factor
+
+    # Calculate max batch size
+    if kv_cache_per_sample > 0:
+        max_batch = int(available / kv_cache_per_sample)
+    else:
+        max_batch = 512
+
+    if verbose:
+        print(f"    GPU memory: {gpu_memory/1e9:.1f}GB total, {allocated/1e9:.2f}GB allocated")
+        print(f"    Available for KV-cache: {available/1e9:.2f}GB (with 10% headroom)")
+        print(f"    KV-cache per sample: {kv_cache_per_sample/1e6:.1f}MB")
+        print(f"    Max batch before capping: {max_batch}")
+
+    # Round down to power of 2, clamp to [1, 512]
+    # Small models can use very large batches for better GPU utilization
+    valid_batches = [512, 256, 128, 64, 32, 16, 8, 4, 2, 1]
+    for b in valid_batches:
+        if b <= max_batch:
+            return b
+
+    return 1
+
+
+def normalize_json(json_str: str) -> str:
+    """Normalize JSON string to minified canonical form (sorted keys, no whitespace).
+
+    This ensures fair comparison between TCT (minified) and UTF8 (formatted) outputs.
+    Normalizes ISO 8601 timestamps:
+    - Strips microseconds: .NNNNNN -> empty (TCT doesn't preserve them)
+    - Normalizes timezone: +00:00 -> Z
+    """
+    try:
+        parsed = json.loads(json_str)
+        result = json.dumps(parsed, separators=(',', ':'), sort_keys=True)
+        # Normalize ISO 8601 UTC timestamps:
+        import re
+        # 1. Strip microseconds: .NNNNNN -> empty (TCT doesn't preserve them)
+        result = re.sub(r'(\d{2}:\d{2}:\d{2})\.\d+', r'\1', result)
+        # 2. Normalize timezone: +00:00 -> Z
+        result = re.sub(r'(\d{2}:\d{2}:\d{2})\+00:00', r'\1Z', result)
+        result = re.sub(r'(\d{2}:\d{2}:\d{2})-00:00', r'\1Z', result)
+        return result
+    except json.JSONDecodeError:
+        return json_str  # Return original if not valid JSON
+
+
+def _count_fields(obj) -> int:
+    """Count total fields/elements in a nested structure for repair comparison."""
+    if isinstance(obj, dict):
+        return len(obj) + sum(_count_fields(v) for v in obj.values())
+    elif isinstance(obj, list):
+        return len(obj) + sum(_count_fields(v) for v in obj)
+    return 0
+
+
+def repair_json(s: str) -> Optional[dict]:
+    """Try to parse incomplete JSON by adding missing closing brackets.
+
+    This enables extracting fields from partial/truncated JSON outputs.
+    Returns the parsed dict if successful, None otherwise.
+
+    The correct closing order is determined by tracking opening brackets
+    as they appear in the prefix, then closing in reverse order.
+
+    Multiple repair strategies are attempted and the one recovering the
+    most structure (fields/elements) is returned:
+    1. Direct repair: add closing brackets if not inside a string
+    2. Comma truncation: truncate at last comma (field boundary)
+    3. Key-value removal: remove incomplete key-value pairs
+    4. Trailing key removal: handle "key": with no value
+
+    Only returns dicts (JSON objects), not arrays or primitives, since
+    the field extractor requires object structure.
+    """
+    if not s or not s.strip():
+        return None
+
+    # Try standard parsing first
+    try:
+        result = json.loads(s)
+        # Only return if it's a dict (JSON object)
+        return result if isinstance(result, dict) else None
+    except json.JSONDecodeError:
+        pass
+
+    # Try direct repair (add closing brackets if not inside a string)
+    result = _repair_json_impl(s)
+    if result is not None:
+        return result
+
+    # Collect candidates from multiple repair strategies
+    candidates: List[dict] = []
+
+    # Strategy 1: Comma truncation (handles mid-string truncation)
+    last_comma = s.rfind(',')
+    comma_attempts = 0
+    while last_comma > 0 and comma_attempts < 50:
+        comma_attempts += 1
+        truncated = s[:last_comma]
+        result = _repair_json_impl(truncated)
+        if result is not None:
+            candidates.append(result)
+            break  # First successful is usually best for this strategy
+        last_comma = s.rfind(',', 0, last_comma)
+
+    # Strategy 2: Key-value removal (handles nested truncation without commas)
+    # Find all "key": patterns and try removing incomplete key-value pairs
+    colon_pattern = r'"(?:[^"\\]|\\.)*"\s*:'
+    matches = list(re.finditer(colon_pattern, s))
+    for match in reversed(matches):
+        key_start = match.start()
+        before = s[:key_start].rstrip()
+        if before and before[-1] in ',{':
+            if before[-1] == ',':
+                before = before[:-1]
+            result = _repair_json_impl(before)
+            if result is not None:
+                candidates.append(result)
+                break  # First successful is usually best
+
+    # Strategy 3: Trailing key pattern (handles "key": with no value)
+    trailing_key_pattern = r',?\s*"(?:[^"\\]|\\.)*"\s*:\s*$'
+    cleaned = re.sub(trailing_key_pattern, '', s)
+    if cleaned != s and cleaned.strip():
+        result = _repair_json_impl(cleaned)
+        if result is not None:
+            candidates.append(result)
+
+    # Return the candidate with the most recovered structure
+    if candidates:
+        return max(candidates, key=_count_fields)
+
+    return None
+
+
+def _repair_json_impl(s: str) -> Optional[dict]:
+    """Implementation of JSON repair - add missing closing brackets."""
+    if not s or not s.strip():
+        return None
+
+    # Track opening brackets in order, accounting for closers
+    # We use a stack: push openers, pop on closers
+    stack = []
+    in_string = False
+    escape_next = False
+
+    for char in s:
+        if escape_next:
+            escape_next = False
+            continue
+        if char == '\\':
+            escape_next = True
+            continue
+        if char == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+
+        if char == '{':
+            stack.append('}')
+        elif char == '[':
+            stack.append(']')
+        elif char == '}':
+            if stack and stack[-1] == '}':
+                stack.pop()
+        elif char == ']':
+            if stack and stack[-1] == ']':
+                stack.pop()
+
+    if not stack:
+        return None  # No unclosed brackets
+
+    # If we ended inside a string, we cannot repair this truncation point
+    if in_string:
+        return None
+
+    # Close in reverse order of opening
+    suffix = ''.join(reversed(stack))
+    try:
+        result = json.loads(s + suffix)
+        # Only return if it's a dict (JSON object)
+        return result if isinstance(result, dict) else None
+    except json.JSONDecodeError:
+        return None
+
+
+def find_checkpoint_dir(schema: str, tokenizer: str, model_size: str, checkpoint_base: Path = None) -> Path:
+    """Find checkpoint directory for a given schema, tokenizer, and model size.
+
+    Args:
+        schema: Schema name (kubernetes, tsconfig, eslintrc)
+        tokenizer: Tokenizer type (tct, utf8)
+        model_size: Model size (tiny, mini, base, small, medium)
+        checkpoint_base: Base directory for checkpoints (default: checkpoints/)
+
+    Returns:
+        Path to checkpoint directory
+
+    Raises:
+        FileNotFoundError: If checkpoint directory doesn't exist
+    """
+    if checkpoint_base is None:
+        # Default to checkpoints/ directory in project root
+        script_dir = Path(__file__).parent
+        project_root = script_dir.parent
+        checkpoint_base = project_root / "checkpoints"
+
+    # Checkpoint directory naming: {schema}_{tokenizer}_{model_size}
+    checkpoint_name = f"{schema}_{tokenizer}_{model_size}"
+    checkpoint_dir = checkpoint_base / checkpoint_name
+
+    if not checkpoint_dir.exists():
+        raise FileNotFoundError(
+            f"Checkpoint directory not found: {checkpoint_dir}\n"
+            f"Expected structure: checkpoints/{checkpoint_name}/"
+        )
+
+    # Verify model.pt exists
+    model_path = checkpoint_dir / "model.pt"
+    if not model_path.exists():
+        raise FileNotFoundError(
+            f"No model.pt found in {checkpoint_dir}\n"
+            f"Expected: {model_path}"
+        )
+
+    return checkpoint_dir
+
+
+def load_model(checkpoint_dir: Path, device: str = "cuda", epoch: int = None):
+    """Load model from checkpoint directory.
+
+    Infers model config from directory name (schema_tokenizer_size) and state_dict.
+    No config.json required.
+
+    Args:
+        checkpoint_dir: Path to checkpoint directory
+        device: Device to load model on
+        epoch: Unused (kept for API compatibility)
+
+    Returns the model and a config dict with schema info.
+    """
+    import torch
+    from nanochat.gpt import GPT, GPTConfig
+    from configs import get_schema_config, get_model_config
+
+    # Parse directory name: {schema}_{tokenizer}_{size}
+    dir_name = checkpoint_dir.name
+    parts = dir_name.split("_")
+    if len(parts) < 3:
+        raise ValueError(f"Cannot parse checkpoint dir name: {dir_name}, expected schema_tokenizer_size")
+
+    schema = parts[0]
+    tokenizer = parts[1]
+    model_size = "_".join(parts[2:])  # Handle sizes like "small-wide"
+
+    # Get schema config for vocab size and context
+    schema_cfg = get_schema_config(schema)
+    vocab_size = schema_cfg[f"{tokenizer}_vocab_size"]
+    context_size = schema_cfg["context_size"]
+
+    # Get model config for architecture
+    model_cfg = get_model_config(model_size, vocab_size, context_size)
+
+    model_config = GPTConfig(
+        vocab_size=vocab_size,
+        sequence_len=context_size,
+        n_layer=model_cfg["n_layers"],
+        n_head=model_cfg["n_heads"],
+        n_kv_head=model_cfg.get("n_kv_heads", model_cfg["n_heads"]),
+        n_embd=model_cfg["d_model"],
+        use_swiglu=model_cfg.get("use_swiglu", True),
+        ffn_mult=model_cfg.get("ffn_mult", 3.0),
+    )
+
+    model = GPT(model_config)
+
+    # Load model.pt
+    checkpoint_path = checkpoint_dir / "model.pt"
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"model.pt not found in {checkpoint_dir}")
+
+    print(f"  Loading checkpoint: {checkpoint_path}")
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+
+    # Handle checkpoint format (may have model_state_dict key or be raw state_dict)
+    if "model_state_dict" in ckpt:
+        state_dict = ckpt["model_state_dict"]
+    else:
+        state_dict = ckpt
+
+    model.load_state_dict(state_dict)
+
+    model.to(device)
+    model.eval()
+
+    # Build config dict for compatibility
+    config_dict = {
+        "schema": schema,
+        "tokenizer": tokenizer,
+        "model_size": model_size,
+        "vocab_size": vocab_size,
+        "context_size": context_size,
+        "schema_config": schema_cfg,
+        "model_config": model_cfg,
+    }
+
+    return model, config_dict
+
+
+def create_random_model(vocab_size: int, device: str = "cuda"):
+    """Create a random model for testing."""
+    from nanochat.gpt import GPT, GPTConfig
+
+    model_config = GPTConfig(
+        vocab_size=vocab_size,
+        sequence_len=512,
+        n_layer=4,
+        n_head=4,
+        n_kv_head=4,
+        n_embd=128,
+    )
+    model = GPT(model_config)
+    model.to(device)
+    model.eval()
+    return model, {
+        "vocab_size": vocab_size,
+        "sequence_len": 512,
+        "n_layer": 4,
+        "n_head": 4,
+        "n_embd": 128,
+    }
+
+
+def compute_valid_indices(
+    utf8_tokens: List[List[int]],
+    tct_tokens: List[List[int]],
+    max_seq_len: int,
+) -> List[int]:
+    """Compute indices of samples that are valid for BOTH tokenizers.
+
+    A sample is valid if its token count is <= max_seq_len in BOTH tokenizations.
+    This ensures fair comparison by evaluating identical samples.
+    """
+    valid_indices = []
+    for i in range(min(len(utf8_tokens), len(tct_tokens))):
+        utf8_len = len(utf8_tokens[i])
+        tct_len = len(tct_tokens[i])
+        if utf8_len <= max_seq_len and tct_len <= max_seq_len:
+            valid_indices.append(i)
+    return valid_indices
+
+
+def load_validation_tokens(
+    data_dir: Path,
+    max_samples: int = 1000,
+    max_len: Optional[int] = None,
+    partner_data_dir: Optional[Path] = None,
+) -> List[List[int]]:
+    """Load validation tokens using the same split logic as training.
+
+    Uses get_validation_sequences from nanochat.jsonl_dataloader to ensure training
+    and evaluation use identical validation splits.
+
+    Args:
+        data_dir: Path to data directory containing all.jsonl
+        max_samples: Maximum number of samples to return
+        max_len: Filter sequences longer than this (same as training context_size)
+        partner_data_dir: Partner data directory for coordinated filtering
+
+    Returns:
+        List of token sequences
+    """
+    from nanochat.jsonl_dataloader import get_validation_sequences
+
+    return get_validation_sequences(
+        data_dir=data_dir,
+        max_len=max_len,
+        partner_data_dir=partner_data_dir,
+        train_ratio=0.95,  # Same as training
+        seed=42,  # Same as training
+        max_samples=max_samples,
+        verbose=False,
+    )
+
+
+def load_validation_tokens_with_target(
+    utf8_data_dir: Path,
+    tct_data_dir: Optional[Path],
+    target_valid: Optional[int],
+    max_seq_len: int,
+    max_iterations: int = 10,
+) -> tuple:
+    """Load validation tokens using training-consistent split with coordinated filtering.
+
+    Uses get_validation_sequences from nanochat.jsonl_dataloader which applies:
+    1. Coordinated filtering (exclude if exceeds max_seq_len in EITHER tokenization)
+    2. Shuffle with seed=42 (same as training)
+    3. 95/5 train/val split (same as training)
+
+    Args:
+        utf8_data_dir: Path to UTF8 data directory
+        tct_data_dir: Path to TCT data directory (or None for UTF8-only)
+        target_valid: Target number of valid samples (None = all available)
+        max_seq_len: Maximum sequence length filter
+        max_iterations: Unused (kept for API compatibility)
+
+    Returns:
+        Tuple of (utf8_tokens, tct_tokens, valid_indices) where tokens are filtered lists
+    """
+    from nanochat.jsonl_dataloader import get_validation_sequences
+
+    # Load UTF8 validation with coordinated filtering
+    utf8_tokens = get_validation_sequences(
+        data_dir=utf8_data_dir,
+        max_len=max_seq_len,
+        partner_data_dir=tct_data_dir,
+        train_ratio=0.95,
+        seed=42,
+        max_samples=None,  # Get all, then limit
+        verbose=True,
+    )
+
+    # Load TCT validation with coordinated filtering (same indices due to same filtering)
+    if tct_data_dir:
+        tct_tokens = get_validation_sequences(
+            data_dir=tct_data_dir,
+            max_len=max_seq_len,
+            partner_data_dir=utf8_data_dir,
+            train_ratio=0.95,
+            seed=42,
+            max_samples=None,
+            verbose=False,  # Already printed for UTF8
+        )
+    else:
+        tct_tokens = None
+
+    # Limit to target_valid samples if specified
+    num_available = len(utf8_tokens)
+    if target_valid is not None:
+        if num_available < target_valid:
+            print(f"  WARNING: Only {num_available} valid samples available (requested {target_valid})")
+            target_valid = num_available
+
+        utf8_tokens = utf8_tokens[:target_valid]
+        if tct_tokens:
+            tct_tokens = tct_tokens[:target_valid]
+
+    # Valid indices are just 0..N-1 since filtering is already done
+    valid_indices = list(range(len(utf8_tokens)))
+
+    print(f"  Using {len(utf8_tokens)} validation samples (coordinated filtering, seed=42)")
+    return utf8_tokens, tct_tokens, valid_indices
+
+
+def find_merge_table(schema: str, tokenizer: str = "utf8") -> Path:
+    """Find BPE merge table for schema.
+
+    Args:
+        schema: Schema name (tsconfig, eslintrc, kubernetes)
+        tokenizer: Tokenizer type ("utf8" or "tct") - prefers matching type
+
+    Returns:
+        Path to the merge table JSON file
+    """
+    bpe_dir = Path(__file__).parent.parent / "bpe-merges"
+
+    # Define search order based on tokenizer type
+    if tokenizer == "utf8":
+        # Prefer UTF8 merge tables (matched variants first)
+        suffixes = ["-utf8-bpe-1k-matched", "-utf8-base-matched", "-utf8-bpe-500", "-utf8-bpe"]
+    else:
+        # Prefer TCT merge tables
+        suffixes = ["-tct-bpe-1k", "-tct-bpe-500", "-tct-base"]
+
+    for suffix in suffixes:
+        candidate = bpe_dir / f"{schema}{suffix}.json"
+        if candidate.exists():
+            return candidate
+
+    # Fallback: any merge table for this schema
+    candidates = list(bpe_dir.glob(f"{schema}*.json"))
+    if not candidates:
+        raise FileNotFoundError(f"No merge table for {schema} in {bpe_dir}")
+    return candidates[0]
+
+
+def find_data_dir(schema: str, tokenizer: str = "utf8") -> Path:
+    """Find data directory for schema using schema_configs.py definitions.
+
+    Args:
+        schema: Schema name (tsconfig, eslintrc, kubernetes)
+        tokenizer: Tokenizer type ("utf8" or "tct")
+
+    Raises:
+        FileNotFoundError: If the expected data directory doesn't exist
+    """
+    import os
+    from configs.schema_configs import get_schema_config
+
+    config = get_schema_config(schema)
+
+    if tokenizer == "tct":
+        data_path = config.get("data_path_tct")
+        dir_name = config.get("data_dir_tct")
+    else:
+        data_path = config.get("data_path_utf8")
+        dir_name = config.get("data_dir_utf8")
+
+    # Check configured path first
+    if data_path and Path(data_path).exists():
+        return Path(data_path)
+
+    # Fallback to local data directory
+    code_dir = Path(__file__).parent.parent
+    local_data = code_dir / "data" / dir_name
+    if local_data.exists():
+        return local_data
+
+    raise FileNotFoundError(
+        f"Data directory not found for {schema} ({tokenizer}). "
+        f"Checked: {data_path}, {local_data}"
+    )
+
+
+def run_constrained_bpb(
+    model,
+    schema: str,
+    merge_table: Path,
+    validation_tokens: List[List[int]],
+    device: str,
+    normalize_bytes: bool = True,
+) -> Dict[str, Any]:
+    """Run constrained BPB evaluation.
+
+    Args:
+        model: The model to evaluate
+        schema: Schema name
+        merge_table: Path to BPE merge table
+        validation_tokens: Pre-filtered validation tokens (already filtered by max_seq_len)
+        device: Device to use
+        normalize_bytes: Whether to normalize bytes to minified JSON
+    """
+    from nanochat.xgrammar_tokenizer import (
+        UTF8BPEDecoder,
+        build_xgrammar_tokenizer_info,
+        compile_json_schema_grammar,
+        compute_constrained_bpb,
+        load_schema,
+    )
+
+    print("\n" + "=" * 60)
+    print("UTF8 LOSS EVALUATION")
+    print("=" * 60)
+
+    # Build tokenizer and grammar
+    utf8_decoder = UTF8BPEDecoder(merge_table)
+    print(f"  Merge table: {merge_table}")
+    print(f"  Vocab size: {utf8_decoder.vocab_size()}")
+
+    print("  Building XGrammar tokenizer info...")
+    tokenizer_info = build_xgrammar_tokenizer_info(merge_table)
+
+    print(f"  Loading schema: {schema}")
+    schema_dict = load_schema(schema)
+
+    print("  Compiling grammar...")
+    compiled_grammar = compile_json_schema_grammar(tokenizer_info, schema_dict)
+
+    print(f"  Validation sequences: {len(validation_tokens)} (pre-filtered)")
+
+    # Compute constrained BPB
+    print("\n  Computing loss...")
+    result = compute_constrained_bpb(
+        model=model,
+        tokenizer_info=tokenizer_info,
+        compiled_grammar=compiled_grammar,
+        utf8_decoder=utf8_decoder,
+        validation_tokens=validation_tokens,
+        device=device,
+        max_seq_len=None,  # Already pre-filtered
+        show_progress=True,
+        normalize_bytes=normalize_bytes,
+    )
+
+    print("\n  Results:")
+    print(f"    Sequences:       {result.num_sequences}")
+    print(f"    Tokens:          {result.total_tokens}")
+    print(f"    Bytes:           {result.total_bytes}")
+    raw_loss_per_tok = result.raw_loss / result.total_tokens if result.total_tokens > 0 else 0
+    constrained_loss_per_tok = result.constrained_loss / result.total_tokens if result.total_tokens > 0 else 0
+    print(f"    Raw loss:        {result.raw_loss:.1f} nats ({raw_loss_per_tok:.4f}/tok)")
+    print(f"    Constrained:     {result.constrained_loss:.1f} nats ({constrained_loss_per_tok:.4f}/tok)")
+    loss_reduction = (result.raw_loss - result.constrained_loss) / result.raw_loss * 100 if result.raw_loss > 0 else 0
+    print(f"    Reduction:       {loss_reduction:.1f}%")
+
+    # Build results dict
+    results_dict = {
+        "num_sequences": result.num_sequences,
+        "total_tokens": result.total_tokens,
+        "total_bytes": result.total_bytes,
+        "raw_loss_nats": result.raw_loss,
+        "constrained_loss_nats": result.constrained_loss,
+        "raw_loss_per_token": raw_loss_per_tok,
+        "constrained_loss_per_token": constrained_loss_per_tok,
+        "loss_reduction_percent": loss_reduction,
+    }
+
+    if result.syntax_content:
+        sc = result.syntax_content
+
+        # Semantic loss breakdown (position-based key vs value)
+        # Compute derived values first
+        syntax_tokens = result.total_tokens - sc.key_tokens - sc.value_tokens
+        syntax_loss = result.raw_loss - sc.key_loss - sc.value_loss
+        syntax_pct = 100 - sc.key_loss_pct - sc.value_loss_pct
+
+        print(f"\n  Semantic Loss Breakdown:")
+        print(f"    {'Category':<12} {'Tokens':>8} {'Loss %':>8} {'Loss (nats)':>12}")
+        print(f"    {'-'*44}")
+        print(f"    {'Syntax':<12} {syntax_tokens:>8} {syntax_pct:>7.1f}% {syntax_loss:>12.1f}")
+        print(f"    {'Keys':<12} {sc.key_tokens:>8} {sc.key_loss_pct:>7.1f}% {sc.key_loss:>12.1f}")
+        print(f"    {'Values':<12} {sc.value_tokens:>8} {sc.value_loss_pct:>7.1f}% {sc.value_loss:>12.1f}")
+        print(f"    {'-'*44}")
+        print(f"    {'Total':<12} {result.total_tokens:>8} {'100.0':>7}% {result.raw_loss:>12.1f}")
+        print(f"\n    Loss per token (nats):")
+        print(f"      Raw:         Syntax: {sc.syntax_loss_per_token:.4f}  Key: {sc.key_loss_per_token:.4f}  Value: {sc.value_loss_per_token:.4f}")
+        print(f"      Constrained: Syntax: {sc.constrained_syntax_loss_per_token:.4f}  Key: {sc.constrained_key_loss_per_token:.4f}  Value: {sc.constrained_value_loss_per_token:.4f}")
+        print(f"    Value bytes: {sc.value_bytes} / {result.total_bytes} ({100*sc.value_bytes/result.total_bytes:.1f}%)")
+
+        # Constrained syntax loss (derived)
+        constrained_syntax_loss = result.constrained_loss - sc.constrained_key_loss - sc.constrained_value_loss
+
+        # Build results dict (syntax_tokens, syntax_loss, syntax_pct already computed above)
+        results_dict["semantic_analysis"] = {
+            "syntax_tokens": syntax_tokens,
+            "key_tokens": sc.key_tokens,
+            "value_tokens": sc.value_tokens,
+            # Raw losses
+            "syntax_loss": syntax_loss,
+            "key_loss": sc.key_loss,
+            "value_loss": sc.value_loss,
+            "syntax_loss_pct": syntax_pct,
+            "key_loss_pct": sc.key_loss_pct,
+            "value_loss_pct": sc.value_loss_pct,
+            # Raw loss per token
+            "syntax_loss_per_token": sc.syntax_loss_per_token,
+            "key_loss_per_token": sc.key_loss_per_token,
+            "value_loss_per_token": sc.value_loss_per_token,
+            # Constrained losses
+            "constrained_syntax_loss": constrained_syntax_loss,
+            "constrained_key_loss": sc.constrained_key_loss,
+            "constrained_value_loss": sc.constrained_value_loss,
+            # Constrained loss per token
+            "constrained_syntax_loss_per_token": sc.constrained_syntax_loss_per_token,
+            "constrained_key_loss_per_token": sc.constrained_key_loss_per_token,
+            "constrained_value_loss_per_token": sc.constrained_value_loss_per_token,
+            "value_bytes": sc.value_bytes,
+        }
+
+    return results_dict
+
+
+def generate_samples_xgrammar(
+    model,
+    tokenizer_info,
+    compiled_grammar,
+    utf8_decoder,
+    num_samples: int,
+    max_tokens: int = 2048,
+    temperature: float = 0.3,
+    top_k: int = None,
+    top_p: float = 0.9,
+    show_progress: bool = True,
+    batch_size: int = None,
+    use_compile: bool = False,  # Disabled: torch.compile + KV-cache causes segfaults
+) -> tuple:
+    """Generate samples using UTF8-BPE model with XGrammar constraints.
+
+    Uses KV-cache and batched generation for efficient GPU utilization.
+    Each sample has its own grammar matcher state, but model forward passes
+    are batched for better GPU throughput.
+
+    Generation always starts from BOS token (vocab_size - 1), same as training.
+
+    Args:
+        batch_size: Batch size for generation (None = auto-compute based on GPU memory)
+        use_compile: Whether to use torch.compile for faster inference
+
+    Returns:
+        Tuple of (generated_texts, all_texts, stats_dict) where:
+        - generated_texts: List of valid JSON strings only
+        - all_texts: List of ALL decoded strings (including invalid JSON)
+        - stats_dict contains:
+          - completed: Number of samples where grammar terminated normally
+          - truncated: Number of samples that hit max_tokens before completion
+          - empty: Number of samples that were empty
+          - failed: Number of samples that failed to decode
+    """
+    import random
+    import torch
+    import torch.nn.functional as F
+    import xgrammar
+    from tqdm import tqdm
+    from nanochat.engine import KVCache
+
+    device = next(model.parameters()).device
+
+    # torch.compile with KV-cache can cause segfaults - disabled by default
+    # The issue is that reduce-overhead mode still triggers cudagraphs warnings
+    # and can crash on some GPU/driver combinations
+    if use_compile and not getattr(model, '_compiled', False):
+        if show_progress:
+            print("  Compiling model with torch.compile(mode='reduce-overhead')...")
+        try:
+            model = torch.compile(model, mode="reduce-overhead")
+            model._compiled = True
+        except Exception as e:
+            if show_progress:
+                print(f"  torch.compile failed: {e}, continuing without compilation")
+
+    generated_texts = []
+    all_texts = []  # ALL decoded texts, including invalid JSON
+    completed_count = 0  # Grammar terminated normally
+    truncated_count = 0  # Hit max_tokens before grammar termination
+    empty_count = 0
+    failed_count = 0
+
+    # Get model config for KV cache
+    cfg = model.config
+    kv_kwargs = {
+        "num_heads": cfg.n_kv_head,
+        "head_dim": cfg.n_embd // cfg.n_head,
+        "num_layers": cfg.n_layer,
+    }
+
+    # Auto-compute batch size based on model and GPU memory
+    if batch_size is None:
+        batch_size = compute_generation_batch_size(model, max_tokens, verbose=show_progress)
+        if show_progress:
+            print(f"  Auto batch size: {batch_size} (based on model={cfg.n_embd}d x {cfg.n_layer}L, seq={max_tokens})")
+
+    # BOS token is pad token = vocab_size - 1 (matches training setup, same as TCT)
+    bos_token = utf8_decoder.vocab_size() - 1
+
+    # Process in batches with OOM retry
+    total_tokens_generated = 0
+    gen_start_time = time.time()
+    samples_processed = 0
+    current_batch_size = batch_size  # Start with requested batch size
+    min_batch_size = 1  # Don't go below this
+    batch_idx = 0
+
+    pbar = tqdm(total=num_samples, desc="Generating samples") if show_progress else None
+
+    while samples_processed < num_samples:
+        start_idx = samples_processed
+        end_idx = min(start_idx + current_batch_size, num_samples)
+        actual_batch_size = end_idx - start_idx
+
+        if show_progress and pbar:
+            pbar.set_description(f"Generating (batch_size={current_batch_size})")
+
+        try:
+            # Create grammar matchers and bitmasks for each sample
+            # terminate_without_stop_token=True: Grammar terminates when JSON is complete,
+            # without needing EOS token. This matches training (no EOS markers in training data).
+            matchers = [xgrammar.GrammarMatcher(compiled_grammar, terminate_without_stop_token=True)
+                        for _ in range(actual_batch_size)]
+            bitmasks = [xgrammar.allocate_token_bitmask(1, tokenizer_info.vocab_size)
+                       for _ in range(actual_batch_size)]
+            kv_cache = KVCache(batch_size=actual_batch_size, seq_len=max_tokens + 1, **kv_kwargs)
+
+            # Initialize with BOS tokens (same approach as TCT)
+            batch_tokens = [[] for _ in range(actual_batch_size)]
+
+            # Track which samples are still active (not terminated)
+            active = [True] * actual_batch_size
+            terminated = [False] * actual_batch_size  # Track if grammar terminated vs truncated
+
+            # Prefill with BOS token (model predicts first real token)
+            input_ids = torch.full((actual_batch_size, 1), bos_token, device=device)
+            with torch.no_grad():
+                logits = model(input_ids, kv_cache=kv_cache)
+                logits = logits[:, -1, :]  # [batch, vocab]
+
+            for step in range(max_tokens):
+                # Check if all samples terminated
+                if not any(active):
+                    break
+
+                # Apply grammar masks per sample
+                for i in range(actual_batch_size):
+                    if active[i]:
+                        if matchers[i].is_terminated():
+                            active[i] = False
+                            terminated[i] = True  # Properly completed
+                            continue
+                        xgrammar.reset_token_bitmask(bitmasks[i])
+                        matchers[i].fill_next_token_bitmask(bitmasks[i])
+                        # Apply mask to this sample's logits
+                        logits_i = logits[i:i+1, :]
+                        xgrammar.apply_token_bitmask_inplace(logits_i, bitmasks[i].to(device))
+
+                # Apply temperature and top-k/top-p (batched)
+                if temperature > 0:
+                    logits = logits / temperature
+
+                if top_k is not None and top_k > 0:
+                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)), dim=-1)
+                    logits[logits < v[:, -1:]] = float('-inf')
+
+                if top_p is not None and top_p < 1.0:
+                    # Nucleus sampling: keep smallest set with cumulative prob >= top_p
+                    sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+                    cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                    # Remove tokens with cumulative probability above threshold
+                    sorted_indices_to_remove = cumulative_probs > top_p
+                    # Shift right to keep first token above threshold
+                    sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
+                    sorted_indices_to_remove[:, 0] = False
+                    # Scatter back to original indices
+                    indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                    logits[indices_to_remove] = float('-inf')
+
+                # Sample next tokens
+                probs = F.softmax(logits, dim=-1)
+                next_tokens = torch.multinomial(probs, num_samples=1)  # [batch, 1]
+                next_tokens_list = next_tokens.squeeze(-1).tolist()
+
+                # Accept tokens and update state
+                for i, tok in enumerate(next_tokens_list):
+                    if active[i]:
+                        matchers[i].accept_token(tok)
+                        batch_tokens[i].append(tok)
+
+                # Get next logits using KV cache (batched)
+                with torch.no_grad():
+                    logits = model(next_tokens, kv_cache=kv_cache)
+                    logits = logits[:, -1, :]
+
+            # Decode and validate each sample
+            batch_completed = 0
+            batch_failed = 0
+            for i, tokens in enumerate(batch_tokens):
+                try:
+                    text = utf8_decoder.decode(tokens)
+                    all_texts.append(text)  # Keep ALL decoded text for fair comparison
+                    import json
+                    parsed = json.loads(text)
+                    if parsed and parsed != {}:
+                        generated_texts.append(text)
+                        if terminated[i]:
+                            completed_count += 1
+                            batch_completed += 1
+                        else:
+                            truncated_count += 1  # Valid JSON but hit max_tokens
+                            batch_completed += 1
+                    else:
+                        empty_count += 1
+                        batch_failed += 1
+                except json.JSONDecodeError:
+                    failed_count += 1
+                    batch_failed += 1
+                except Exception:
+                    # Decode failed - still add empty string to all_texts for accounting
+                    if len(all_texts) < start_idx + i + 1:
+                        all_texts.append("")
+                    failed_count += 1
+                    batch_failed += 1
+
+            if show_progress:
+                # Debug: show token counts and termination stats
+                token_counts = [len(t) for t in batch_tokens]
+                avg_tokens = sum(token_counts) / len(token_counts) if token_counts else 0
+                terminated_count = sum(terminated)
+                truncated_batch = batch_completed - sum(1 for i, t in enumerate(terminated) if t and len(batch_tokens[i]) > 0)
+                print(f"  [Batch {batch_idx}] Results: {batch_completed} valid, {batch_failed} failed | "
+                      f"avg_tokens={avg_tokens:.1f}, terminated={terminated_count}, truncated={truncated_batch}")
+                # Show first sample for debugging
+                if batch_idx == 0 and batch_tokens and batch_tokens[0]:
+                    first_text = all_texts[-actual_batch_size] if len(all_texts) >= actual_batch_size else ""
+                    print(f"    First sample ({len(batch_tokens[0])} tokens): {first_text[:200]}...")
+
+            # Success - update progress
+            samples_processed = end_idx
+            batch_idx += 1
+            total_tokens_generated += sum(len(tokens) for tokens in batch_tokens)
+            if pbar:
+                pbar.update(actual_batch_size)
+
+        except torch.cuda.OutOfMemoryError as e:
+            # OOM: retry with smaller batch size
+            if current_batch_size > min_batch_size:
+                new_batch_size = max(min_batch_size, current_batch_size // 2)
+                if show_progress:
+                    print(f"\n  [Batch {batch_idx}] OOM with batch_size={current_batch_size}, retrying with {new_batch_size}")
+                current_batch_size = new_batch_size
+                # Force cleanup before retry
+                import gc
+                gc.collect()
+                torch.cuda.empty_cache()
+                continue  # Retry same samples with smaller batch
+            else:
+                if show_progress:
+                    print(f"\n  [Batch {batch_idx}] OOM even at min_batch_size={min_batch_size}, giving up on {actual_batch_size} samples")
+                failed_count += actual_batch_size
+                all_texts.extend([""] * actual_batch_size)
+                samples_processed = end_idx
+                batch_idx += 1
+                if pbar:
+                    pbar.update(actual_batch_size)
+        except Exception as e:
+            if show_progress:
+                print(f"\n  [Batch {batch_idx}] EXCEPTION: {e}")
+            failed_count += actual_batch_size
+            all_texts.extend([""] * actual_batch_size)
+            samples_processed = end_idx
+            batch_idx += 1
+            if pbar:
+                pbar.update(actual_batch_size)
+        finally:
+            # Explicitly free ALL batch-related GPU memory to prevent OOM on next batch
+            # Note: These variables are created inside the try block and may hold GPU tensors
+            try:
+                del kv_cache
+            except NameError:
+                pass
+            try:
+                del logits, probs, next_tokens, input_ids
+            except NameError:
+                pass
+            try:
+                del sorted_logits, sorted_indices, cumulative_probs, indices_to_remove
+            except NameError:
+                pass
+            # Force garbage collection and CUDA cache clear
+            import gc
+            gc.collect()
+            torch.cuda.empty_cache()
+
+    # Close progress bar
+    if pbar:
+        pbar.close()
+
+    gen_elapsed_time = time.time() - gen_start_time
+    tokens_per_second = total_tokens_generated / gen_elapsed_time if gen_elapsed_time > 0 else 0
+    samples_per_second = num_samples / gen_elapsed_time if gen_elapsed_time > 0 else 0
+
+    stats = {
+        "completed": completed_count,
+        "truncated": truncated_count,
+        "empty": empty_count,
+        "failed": failed_count,
+        "total": num_samples,
+        "completion_rate": completed_count / num_samples if num_samples > 0 else 0,
+        "generation_time_seconds": gen_elapsed_time,
+        "total_tokens_generated": total_tokens_generated,
+        "tokens_per_second": tokens_per_second,
+        "samples_per_second": samples_per_second,
+    }
+
+    if show_progress:
+        print(f"  Completed: {completed_count}/{num_samples} ({stats['completion_rate']:.1%})")
+        print(f"  Truncated: {truncated_count} (valid but hit max_tokens)")
+        print(f"  Empty: {empty_count}, Failed: {failed_count}")
+        print(f"  Throughput: {tokens_per_second:.0f} tokens/sec ({samples_per_second:.2f} samples/sec)")
+
+    return generated_texts, all_texts, stats
+
+
+def generate_samples_utf8_raw(
+    model,
+    utf8_decoder,
+    num_samples: int,
+    max_tokens: int = 2048,
+    temperature: float = 0.3,
+    top_k: int = None,
+    top_p: float = 0.9,
+    show_progress: bool = True,
+    batch_size: int = None,
+    use_compile: bool = False,  # Disabled: torch.compile + KV-cache causes segfaults
+) -> tuple:
+    """Generate samples using UTF8-BPE model WITHOUT any grammar constraints.
+
+    This is the raw model output - no XGrammar masking.
+    Used as a baseline to show what the model generates without constraints.
+    Generation always starts from BOS token (vocab_size - 1), same as training.
+
+    Args:
+        batch_size: Batch size for generation (None = auto-compute based on GPU memory)
+        use_compile: Whether to use torch.compile for faster inference
+
+    Returns:
+        Tuple of (generated_texts, stats_dict) where stats_dict contains:
+        - valid_json: Number of samples that are valid JSON
+        - valid_nonempty: Number of samples that are valid non-empty JSON
+        - invalid: Number of samples that failed JSON parsing
+        - empty: Number of samples that were empty objects
+    """
+    import random
+    import torch
+    import torch.nn.functional as F
+    from tqdm import tqdm
+    from nanochat.engine import KVCache
+
+    device = next(model.parameters()).device
+
+    # torch.compile with KV-cache can cause segfaults - disabled by default
+    if use_compile and not getattr(model, '_compiled', False):
+        if show_progress:
+            print("  Compiling model with torch.compile(mode='reduce-overhead')...")
+        try:
+            model = torch.compile(model, mode="reduce-overhead")
+            model._compiled = True
+        except Exception as e:
+            if show_progress:
+                print(f"  torch.compile failed: {e}, continuing without compilation")
+
+    generated_texts = []
+    valid_json_count = 0
+    valid_nonempty_count = 0
+    invalid_count = 0
+    empty_count = 0
+
+    # Get model config for KV cache
+    cfg = model.config
+    kv_kwargs = {
+        "num_heads": cfg.n_kv_head,
+        "head_dim": cfg.n_embd // cfg.n_head,
+        "num_layers": cfg.n_layer,
+    }
+
+    # Auto-compute batch size based on model and GPU memory
+    if batch_size is None:
+        batch_size = compute_generation_batch_size(model, max_tokens, verbose=show_progress)
+        if show_progress:
+            print(f"  Auto batch size: {batch_size}")
+
+    # BOS token is pad token = vocab_size - 1 (matches training setup, same as TCT)
+    bos_token = utf8_decoder.vocab_size() - 1
+    # EOS token for this vocabulary
+    eos_token = utf8_decoder.eos_token_id()
+
+    # Process in batches
+    num_batches = (num_samples + batch_size - 1) // batch_size
+    iterator = tqdm(range(num_batches), desc="Generating raw UTF8 samples") if show_progress else range(num_batches)
+
+    total_tokens_generated = 0
+    gen_start_time = time.time()
+
+    for batch_idx in iterator:
+        start_idx = batch_idx * batch_size
+        end_idx = min(start_idx + batch_size, num_samples)
+        current_batch_size = end_idx - start_idx
+
+        try:
+            kv_cache = KVCache(batch_size=current_batch_size, seq_len=max_tokens + 1, **kv_kwargs)
+
+            # Initialize with BOS tokens (same approach as TCT)
+            batch_tokens = [[] for _ in range(current_batch_size)]
+
+            # Track which samples are still active (not hit EOS)
+            active = [True] * current_batch_size
+
+            # Prefill with BOS token (model predicts first real token)
+            input_ids = torch.full((current_batch_size, 1), bos_token, device=device)
+            with torch.no_grad():
+                logits = model(input_ids, kv_cache=kv_cache)
+                logits = logits[:, -1, :]
+
+            for step in range(max_tokens):
+                if not any(active):
+                    break
+
+                # Apply temperature and top-k/top-p (batched) - NO grammar masking
+                if temperature > 0:
+                    logits = logits / temperature
+
+                if top_k is not None and top_k > 0:
+                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)), dim=-1)
+                    logits[logits < v[:, -1:]] = float('-inf')
+
+                if top_p is not None and top_p < 1.0:
+                    # Nucleus sampling
+                    sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+                    cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                    sorted_indices_to_remove = cumulative_probs > top_p
+                    sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
+                    sorted_indices_to_remove[:, 0] = False
+                    indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                    logits[indices_to_remove] = float('-inf')
+
+                # Sample next tokens
+                probs = F.softmax(logits, dim=-1)
+                next_tokens = torch.multinomial(probs, num_samples=1)
+                next_tokens_list = next_tokens.squeeze(-1).tolist()
+
+                # Update state
+                for i, tok in enumerate(next_tokens_list):
+                    if active[i]:
+                        if tok == eos_token:
+                            active[i] = False
+                        else:
+                            batch_tokens[i].append(tok)
+
+                # Get next logits using KV cache (batched)
+                with torch.no_grad():
+                    logits = model(next_tokens, kv_cache=kv_cache)
+                    logits = logits[:, -1, :]
+
+            # Decode and validate each sample
+            for tokens in batch_tokens:
+                try:
+                    text = utf8_decoder.decode(tokens)
+                    import json
+                    parsed = json.loads(text)
+                    valid_json_count += 1
+                    if parsed and parsed != {}:
+                        generated_texts.append(text)
+                        valid_nonempty_count += 1
+                    else:
+                        empty_count += 1
+                except (json.JSONDecodeError, Exception):
+                    invalid_count += 1
+
+            # Count tokens on success
+            total_tokens_generated += sum(len(tokens) for tokens in batch_tokens)
+
+        except torch.cuda.OutOfMemoryError as e:
+            if show_progress:
+                print(f"\n  [Batch {batch_idx}] OOM: {e}")
+            invalid_count += current_batch_size
+        except Exception as e:
+            if show_progress:
+                print(f"\n  [Batch {batch_idx}] Exception: {e}")
+            invalid_count += current_batch_size
+        finally:
+            # Explicitly free ALL batch-related GPU memory
+            try:
+                del kv_cache
+            except NameError:
+                pass
+            try:
+                del logits, probs, next_tokens, input_ids
+            except NameError:
+                pass
+            try:
+                del sorted_logits, sorted_indices, cumulative_probs, indices_to_remove
+            except NameError:
+                pass
+            import gc
+            gc.collect()
+            torch.cuda.empty_cache()
+
+    gen_elapsed_time = time.time() - gen_start_time
+    tokens_per_second = total_tokens_generated / gen_elapsed_time if gen_elapsed_time > 0 else 0
+    samples_per_second = num_samples / gen_elapsed_time if gen_elapsed_time > 0 else 0
+
+    stats = {
+        "valid_json": valid_json_count,
+        "valid_nonempty": valid_nonempty_count,
+        "invalid": invalid_count,
+        "empty": empty_count,
+        "total": num_samples,
+        "validity_rate": valid_nonempty_count / num_samples if num_samples > 0 else 0,
+        "generation_time_seconds": gen_elapsed_time,
+        "total_tokens_generated": total_tokens_generated,
+        "tokens_per_second": tokens_per_second,
+        "samples_per_second": samples_per_second,
+    }
+
+    if show_progress and num_samples > 0:
+        print(f"  Valid JSON: {valid_json_count}/{num_samples} ({valid_json_count/num_samples:.1%})")
+        print(f"  Valid non-empty: {valid_nonempty_count}/{num_samples} ({stats['validity_rate']:.1%})")
+        print(f"  Invalid: {invalid_count}, Empty: {empty_count}")
+        print(f"  Throughput: {tokens_per_second:.0f} tokens/sec ({samples_per_second:.2f} samples/sec)")
+
+    return generated_texts, stats
+
+
+def generate_samples_tct(
+    model,
+    tct_module,
+    num_samples: int,
+    max_tokens: int = 2048,
+    temperature: float = 0.3,
+    top_k: int = None,
+    top_p: float = 0.9,
+    show_progress: bool = True,
+    batch_size: int = None,
+    use_compile: bool = False,  # Disabled: torch.compile + KV-cache causes segfaults
+) -> tuple:
+    """Generate samples using TCT model with batched generation.
+
+    TCT is inherently constrained - all outputs are valid by construction.
+    Unlike UTF8+XGrammar, TCT has no explicit EOS token - sequences are complete
+    when they reach a target length. We generate max_tokens and decode.
+
+    Uses KV-cache and batched generation for efficient GPU utilization.
+    Batching provides ~10-30x throughput improvement on small models.
+
+    The model was trained with BOS token (pad token = vocab_size - 1) prepended
+    to all sequences. Generation starts with BOS and lets model predict first
+    real token from scratch.
+
+    Args:
+        model: The GPT model
+        tct_module: TCT tokenizer module (encode/decode/decode_prefix/vocab_size)
+        num_samples: Number of samples to generate
+        max_tokens: Maximum tokens per sample (should match typical training lengths)
+        temperature: Sampling temperature
+        top_k: Top-k sampling parameter
+        show_progress: Whether to show progress bar
+        batch_size: Batch size for generation (None = auto-compute based on GPU memory)
+        use_compile: Whether to use torch.compile for faster inference
+
+    Returns:
+        Tuple of (completed_texts, all_texts, stats_dict) where:
+        - completed_texts: List of valid non-empty JSON strings from decode() ONLY (no decode_prefix)
+        - all_texts: List of ALL decoded strings (including decode_prefix and empty/failed)
+        - stats_dict contains:
+          - completed: Number of samples where decode() succeeded
+          - partial: Number of samples where decode() failed but decode_prefix() succeeded
+          - empty: Number of samples that decoded to empty objects
+          - failed: Number of samples where both decode methods failed
+    """
+    import torch
+    import torch.nn.functional as F
+    from tqdm import tqdm
+    from nanochat.engine import KVCache
+
+    device = next(model.parameters()).device
+
+    # torch.compile with KV-cache can cause segfaults - disabled by default
+    if use_compile and not getattr(model, '_compiled', False):
+        if show_progress:
+            print("  Compiling model with torch.compile(mode='reduce-overhead')...")
+        try:
+            model = torch.compile(model, mode="reduce-overhead")
+            model._compiled = True
+        except Exception as e:
+            if show_progress:
+                print(f"  torch.compile failed: {e}, continuing without compilation")
+
+    completed_texts = []  # Only decode() successful samples (for primary comparison)
+    all_texts = []  # ALL decoded texts, including partial/failed for fair comparison
+    completed_count = 0  # TCT decode completed (is_complete=True)
+    partial_count = 0    # decode() failed but decode_prefix() succeeded
+    failed_count = 0     # Both decode methods failed
+    empty_count = 0
+
+    # Get model config for KV cache
+    cfg = model.config
+    kv_kwargs = {
+        "num_heads": cfg.n_kv_head,
+        "head_dim": cfg.n_embd // cfg.n_head,
+        "num_layers": cfg.n_layer,
+    }
+
+    # Auto-compute batch size based on model and GPU memory
+    if batch_size is None:
+        batch_size = compute_generation_batch_size(model, max_tokens, verbose=show_progress)
+        if show_progress:
+            print(f"  Auto batch size: {batch_size} (based on model={cfg.n_embd}d x {cfg.n_layer}L, seq={max_tokens})")
+
+    # BOS token is pad token = vocab_size - 1 (matches training setup)
+    bos_token = tct_module.vocab_size() - 1
+
+    # Process in batches
+    num_batches = (num_samples + batch_size - 1) // batch_size
+    iterator = tqdm(range(num_batches), desc="Generating TCT samples") if show_progress else range(num_batches)
+
+    all_generated_tokens = []
+    total_tokens_generated = 0
+    gen_start_time = time.time()
+
+    for batch_idx in iterator:
+        # Periodic memory check during generation
+        if show_progress and batch_idx > 0 and batch_idx % 10 == 0:
+            process = psutil.Process()
+            cpu_mem_gb = process.memory_info().rss / 1e9
+            gpu_mem_gb = torch.cuda.memory_allocated() / 1e9 if torch.cuda.is_available() else 0
+            samples_done = batch_idx * batch_size
+            log(f"    Batch {batch_idx}/{num_batches}, samples: {samples_done}, CPU: {cpu_mem_gb:.2f}GB, GPU: {gpu_mem_gb:.2f}GB")
+
+        # Calculate actual batch size for this batch (last batch may be smaller)
+        start_idx = batch_idx * batch_size
+        end_idx = min(start_idx + batch_size, num_samples)
+        current_batch_size = end_idx - start_idx
+
+        try:
+            # Create KV cache for this batch
+            kv_cache = KVCache(batch_size=current_batch_size, seq_len=max_tokens + 1, **kv_kwargs)
+
+            # Initialize with BOS tokens for all samples in batch
+            input_ids = torch.full((current_batch_size, 1), bos_token, device=device)
+
+            # Track generated tokens for each sample in batch
+            batch_tokens = [[bos_token] for _ in range(current_batch_size)]
+
+            # Prefill with BOS token
+            with torch.no_grad():
+                logits = model(input_ids, kv_cache=kv_cache)
+                logits = logits[:, -1, :]  # [batch, vocab]
+
+            # Generate max_tokens for all samples in parallel
+            for step in range(max_tokens):
+                # Apply temperature and top-k/top-p
+                if temperature > 0:
+                    logits = logits / temperature
+
+                if top_k is not None and top_k > 0:
+                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)), dim=-1)
+                    logits[logits < v[:, -1:]] = float('-inf')
+
+                if top_p is not None and top_p < 1.0:
+                    # Nucleus sampling
+                    sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+                    cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                    sorted_indices_to_remove = cumulative_probs > top_p
+                    sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
+                    sorted_indices_to_remove[:, 0] = False
+                    indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                    logits[indices_to_remove] = float('-inf')
+
+                # Sample next tokens for all samples
+                probs = F.softmax(logits, dim=-1)
+                next_tokens = torch.multinomial(probs, num_samples=1)  # [batch, 1]
+
+                # Store generated tokens
+                next_tokens_list = next_tokens.squeeze(-1).tolist()
+                for i, tok in enumerate(next_tokens_list):
+                    batch_tokens[i].append(tok)
+
+                # Get next logits using KV cache
+                with torch.no_grad():
+                    logits = model(next_tokens, kv_cache=kv_cache)
+                    logits = logits[:, -1, :]
+
+            # Store all generated token sequences from this batch
+            all_generated_tokens.extend(batch_tokens)
+            total_tokens_generated += sum(len(tokens) for tokens in batch_tokens)
+
+        except torch.cuda.OutOfMemoryError as e:
+            if show_progress:
+                print(f"\n  [Batch {batch_idx}] OOM: {e}")
+            failed_count += current_batch_size
+        except Exception as e:
+            if show_progress:
+                print(f"\n  [Batch {batch_idx}] Exception: {e}")
+            failed_count += current_batch_size
+        finally:
+            # Explicitly free ALL batch-related GPU memory
+            try:
+                del kv_cache
+            except NameError:
+                pass
+            try:
+                del logits, probs, next_tokens, input_ids
+            except NameError:
+                pass
+            try:
+                del sorted_logits, sorted_indices, cumulative_probs, indices_to_remove
+            except NameError:
+                pass
+            import gc
+            gc.collect()
+            torch.cuda.empty_cache()
+
+    gen_elapsed_time = time.time() - gen_start_time
+
+    # Memory stats after generation
+    if show_progress:
+        process = psutil.Process()
+        cpu_mem_gb = process.memory_info().rss / 1e9
+        gpu_mem_gb = torch.cuda.memory_allocated() / 1e9 if torch.cuda.is_available() else 0
+        total_tokens_in_list = sum(len(t) for t in all_generated_tokens)
+        log(f"  Generation complete. CPU mem: {cpu_mem_gb:.2f}GB, GPU mem: {gpu_mem_gb:.2f}GB")
+        log(f"  Token sequences: {len(all_generated_tokens)}, total tokens: {total_tokens_in_list}")
+
+    # Decode all samples (this is sequential, but decoding is fast)
+    if show_progress:
+        log(f"  Decoding {len(all_generated_tokens)} samples...")
+        # Debug: show first few token sequences
+        for i in range(min(3, len(all_generated_tokens))):
+            seq = all_generated_tokens[i]
+            log(f"    Sample {i}: {len(seq)} tokens, first 10: {seq[:10]}")
+
+    # Process decoding in chunks to avoid memory issues
+    decode_chunk_size = 1000
+
+    for idx, generated_tokens in enumerate(all_generated_tokens):
+        # Periodic memory check and garbage collection
+        if idx % decode_chunk_size == 0:
+            gc.collect()
+            if show_progress:
+                process = psutil.Process()
+                cpu_mem_gb = process.memory_info().rss / 1e9
+                log(f"    Decoding sample {idx}/{len(all_generated_tokens)}, CPU mem: {cpu_mem_gb:.2f}GB")
+                sys.stdout.flush()
+                sys.stderr.flush()
+
+        tokens_to_decode = generated_tokens[1:]  # Skip BOS
+        # Debug first decode
+        if idx == 0 and show_progress:
+            log(f"    First decode: {len(tokens_to_decode)} tokens: {tokens_to_decode[:20]}...")
+            sys.stdout.flush()
+
+        json_out = None
+        is_partial = False
+
+        # Try decode() first (complete decoding)
+        try:
+            json_out, _, _ = tct_module.decode(tokens_to_decode)
+        except Exception:
+            # decode() failed, try decode_prefix() as fallback for partial output
+            try:
+                json_out, _, _ = tct_module.decode_prefix(tokens_to_decode)
+                is_partial = True
+            except Exception:
+                # Both methods failed
+                all_texts.append("")  # Empty string for failed decode
+                failed_count += 1
+                continue
+
+        # Store the decoded text for all-samples metrics
+        all_texts.append(json_out if json_out else "")
+
+        if json_out and json_out != "{}":
+            if is_partial:
+                partial_count += 1
+            else:
+                completed_texts.append(json_out)  # Only decode() successful
+                completed_count += 1
+        else:
+            empty_count += 1
+
+    tokens_per_second = total_tokens_generated / gen_elapsed_time if gen_elapsed_time > 0 else 0
+    samples_per_second = num_samples / gen_elapsed_time if gen_elapsed_time > 0 else 0
+
+    stats = {
+        "completed": completed_count,
+        "partial": partial_count,  # decode() failed but decode_prefix() succeeded
+        "empty": empty_count,
+        "failed": failed_count,
+        "total": num_samples,
+        "completion_rate": completed_count / num_samples if num_samples > 0 else 0,
+        "generation_time_seconds": gen_elapsed_time,
+        "total_tokens_generated": total_tokens_generated,
+        "tokens_per_second": tokens_per_second,
+        "samples_per_second": samples_per_second,
+    }
+
+    if show_progress:
+        print(f"  Completed: {completed_count}/{num_samples} ({stats['completion_rate']:.1%})")
+        print(f"  Partial (decode_prefix fallback): {partial_count}")
+        print(f"  Empty: {empty_count}, Failed: {failed_count}")
+        print(f"  Throughput: {tokens_per_second:.0f} tokens/sec ({samples_per_second:.2f} samples/sec)")
+
+    return completed_texts, all_texts, stats
+
+
+def run_generation_quality_utf8(
+    model,
+    schema: str,
+    merge_table: Path,
+    validation_tokens: List[List[int]],
+    num_samples: int,
+    device: str,
+    temperature: float = 0.3,
+    top_k: int = None,
+    top_p: float = 0.9,
+    max_tokens: int = 2048,
+    normalize_json_output: bool = True,
+    batch_size: int = None,
+) -> Dict[str, Any]:
+    """Run generation quality evaluation for UTF8-BPE model with XGrammar.
+
+    Args:
+        validation_tokens: Pre-filtered validation token sequences (same as used for BPB)
+        num_samples: Number of samples to generate
+        normalize_json_output: If True, normalize ground truth and generated JSON
+                              to minified form for consistent field extraction
+    """
+    from nanochat.field_extractors import get_extractor
+    from nanochat.distribution_metrics import compare_extraction_results
+    from nanochat.xgrammar_tokenizer import (
+        UTF8BPEDecoder,
+        build_xgrammar_tokenizer_info,
+        compile_json_schema_grammar,
+        load_schema,
+    )
+
+    print("\n" + "=" * 60)
+    print("GENERATION QUALITY EVALUATION (UTF8-BPE + XGrammar)")
+    print("=" * 60)
+
+    # Get field extractor
+    extractor = get_extractor(schema)
+    print(f"  Schema: {schema}")
+    print(f"  Fields defined: {len(extractor.field_definitions)}")
+
+    # Build tokenizer and grammar for generation
+    utf8_decoder = UTF8BPEDecoder(merge_table)
+    tokenizer_info = build_xgrammar_tokenizer_info(merge_table)
+    schema_dict = load_schema(schema)
+    compiled_grammar = compile_json_schema_grammar(tokenizer_info, schema_dict)
+
+    # Decode ALL validation samples for ground truth distribution (best estimate of true distribution)
+    # Strip BOS token before decoding (get_validation_sequences prepends it)
+    bos_token_id = utf8_decoder.eos_token_id()
+    print(f"\n  Extracting ground truth distribution from {len(validation_tokens)} validation samples...")
+    val_texts = [utf8_decoder.decode(tokens[1:] if tokens and tokens[0] == bos_token_id else tokens)
+                 for tokens in validation_tokens]
+
+    # Optionally normalize to canonical JSON for consistent comparison
+    if normalize_json_output:
+        val_texts = [normalize_json(t) for t in val_texts]
+
+    real_result = extractor.extract_from_samples(val_texts)
+    print(f"  Validation samples: {real_result.num_valid}/{real_result.num_samples} valid")
+
+    # Report ground truth distribution
+    print("\n  Ground truth field distributions:")
+    for name, dist in sorted(real_result.field_distributions.items()):
+        if dist.total > 0:
+            print(f"    {name}: n={dist.total}, mode={dist.mode()}")
+
+    # Generate samples from model (starts from BOS token, same as training)
+    print(f"\n  Generating {num_samples} samples with XGrammar constraints...")
+    generated_texts, all_texts, gen_stats = generate_samples_xgrammar(
+        model=model,
+        tokenizer_info=tokenizer_info,
+        compiled_grammar=compiled_grammar,
+        utf8_decoder=utf8_decoder,
+        num_samples=num_samples,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
+        show_progress=True,
+        batch_size=batch_size,
+    )
+
+    # Optionally normalize generated samples to canonical JSON
+    if normalize_json_output:
+        generated_texts = [normalize_json(t) for t in generated_texts]
+
+    # Extract fields from generated samples
+    print(f"\n  Extracting fields from {len(generated_texts)} generated samples...")
+    gen_result = extractor.extract_from_samples(generated_texts)
+    print(f"  Generated samples: {gen_result.num_valid}/{gen_result.num_samples} valid")
+
+    # Report generated distribution
+    print("\n  Generated field distributions:")
+    for name, dist in sorted(gen_result.field_distributions.items()):
+        if dist.total > 0:
+            print(f"    {name}: n={dist.total}, mode={dist.mode()}")
+
+    # Compare distributions
+    print("\n  Comparing distributions...")
+    comparison = compare_extraction_results(real_result, gen_result)
+
+    print(f"\n  Distribution Comparison Summary:")
+    print(f"    Mean KL divergence:  {comparison.mean_kl:.4f}")
+    print(f"    Mean TV distance:    {comparison.mean_tv:.4f}")
+    print(f"    Mean coverage:       {comparison.mean_coverage:.2%}")
+    print(f"    Mode match rate:     {comparison.mode_match_rate:.2%}")
+
+    # Per-field details
+    print("\n  Per-field comparison:")
+    for name, comp in sorted(comparison.field_comparisons.items()):
+        match = "Y" if comp.mode_match else "N"
+        print(f"    {name}: KL={comp.kl_divergence:.3f} TV={comp.total_variation:.3f} mode_match={match}")
+
+    # === ALL-SAMPLES METRICS (Fair Comparison) ===
+    # Extract fields from ALL generated outputs, including repaired incomplete JSON
+    # This provides a fairer comparison since UTF8+XGrammar discards ~51% of samples
+    print(f"\n  Extracting from ALL {len(all_texts)} samples (including incomplete)...")
+
+    # Repair incomplete JSON
+    repaired_objs = [repair_json(t) for t in all_texts]
+    repaired_count = sum(1 for obj in repaired_objs if obj is not None)
+    print(f"  Repair stats: {repaired_count}/{len(all_texts)} samples repaired ({100*repaired_count/len(all_texts):.1f}%)")
+
+    # Convert repaired dicts to JSON strings for extractor
+    repaired_json = [json.dumps(obj, separators=(',', ':'), sort_keys=True)
+                     for obj in repaired_objs if obj is not None]
+
+    # Extract fields from all repaired samples
+    gen_result_all = extractor.extract_from_samples(repaired_json)
+    print(f"  All-samples extraction: {gen_result_all.num_valid}/{gen_result_all.num_samples} valid")
+
+    # Compare using all extracted fields
+    comparison_all = compare_extraction_results(real_result, gen_result_all)
+
+    print(f"\n  ALL-SAMPLES Distribution Comparison:")
+    print(f"    Mean KL divergence:  {comparison_all.mean_kl:.4f}")
+    print(f"    Mean TV distance:    {comparison_all.mean_tv:.4f}")
+    print(f"    Mean coverage:       {comparison_all.mean_coverage:.2%}")
+    print(f"    Mode match rate:     {comparison_all.mode_match_rate:.2%}")
+
+    # Verification assertions
+    assert len(all_texts) == gen_stats["total"], \
+        f"all_texts doesn't match generation total: {len(all_texts)} vs {gen_stats['total']}"
+    assert gen_result_all.num_valid >= gen_result.num_valid, \
+        f"All-samples should have >= valid samples than valid-only: {gen_result_all.num_valid} < {gen_result.num_valid}"
+
+    return {
+        "schema": schema,
+        "model_type": "utf8_xgrammar",
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "validation_samples": real_result.num_valid,
+        "generated_samples": gen_result.num_valid,
+        "generation_stats": gen_stats,
+        "ground_truth_distributions": real_result.to_dict()["field_distributions"],
+        "generated_distributions": gen_result.to_dict()["field_distributions"],
+        "comparison": comparison.to_dict(),
+        # New: all-samples metrics for fair comparison
+        "all_samples_comparison": comparison_all.to_dict(),
+        "all_samples_repaired": repaired_count,
+        "all_samples_total": len(all_texts),
+        "all_samples_valid": gen_result_all.num_valid,
+    }
+
+
+def run_generation_quality_tct(
+    model,
+    schema: str,
+    tct_module,
+    validation_json_strings: List[str],
+    num_samples: int,
+    temperature: float = 0.3,
+    top_k: int = None,
+    top_p: float = 0.9,
+    max_tokens: int = 2048,
+    normalize_json_output: bool = True,
+) -> Dict[str, Any]:
+    """Run generation quality evaluation for TCT model.
+
+    Args:
+        model: The GPT model
+        schema: Schema name ("tsconfig", "eslintrc", "kubernetes")
+        tct_module: TCT tokenizer module
+        validation_json_strings: Ground truth JSON strings from validation set
+        num_samples: Number of samples to generate
+        temperature: Sampling temperature
+        max_tokens: Maximum tokens per sample
+        normalize_json_output: If True, normalize ground truth and generated JSON
+                              to minified form for consistent field extraction
+
+    Returns:
+        Dict with generation results and distribution comparison
+    """
+    from nanochat.field_extractors import get_extractor
+    from nanochat.distribution_metrics import compare_extraction_results
+
+    print("\n" + "=" * 60)
+    print("GENERATION QUALITY EVALUATION (TCT)")
+    print("=" * 60)
+
+    # Get field extractor
+    extractor = get_extractor(schema)
+    print(f"  Schema: {schema}")
+    print(f"  Fields defined: {len(extractor.field_definitions)}")
+
+    # Extract ground truth distribution from validation samples
+    print(f"\n  Extracting ground truth distribution from {len(validation_json_strings)} validation samples...")
+
+    # Optionally normalize ground truth to canonical JSON
+    if normalize_json_output:
+        validation_json_strings = [normalize_json(s) for s in validation_json_strings]
+
+    real_result = extractor.extract_from_samples(validation_json_strings)
+    print(f"  Validation samples: {real_result.num_valid}/{real_result.num_samples} valid")
+
+    # Report ground truth distribution
+    print("\n  Ground truth field distributions:")
+    for name, dist in sorted(real_result.field_distributions.items()):
+        if dist.total > 0:
+            print(f"    {name}: n={dist.total}, mode={dist.mode()}")
+
+    # Generate samples from TCT model (starts from BOS token, same as training)
+    print(f"\n  Generating {num_samples} samples with TCT model...")
+    generated_texts, all_texts, gen_stats = generate_samples_tct(
+        model=model,
+        tct_module=tct_module,
+        num_samples=num_samples,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
+        show_progress=True,
+    )
+
+    # Optionally normalize generated samples to canonical JSON
+    if normalize_json_output:
+        generated_texts = [normalize_json(t) for t in generated_texts]
+
+    # Extract fields from generated samples
+    print(f"\n  Extracting fields from {len(generated_texts)} generated samples...")
+    gen_result = extractor.extract_from_samples(generated_texts)
+    print(f"  Generated samples: {gen_result.num_valid}/{gen_result.num_samples} valid")
+
+    # Report generated distribution
+    print("\n  Generated field distributions:")
+    for name, dist in sorted(gen_result.field_distributions.items()):
+        if dist.total > 0:
+            print(f"    {name}: n={dist.total}, mode={dist.mode()}")
+
+    # Compare distributions
+    print("\n  Comparing distributions...")
+    comparison = compare_extraction_results(real_result, gen_result)
+
+    print(f"\n  Distribution Comparison Summary:")
+    print(f"    Mean KL divergence:  {comparison.mean_kl:.4f}")
+    print(f"    Mean TV distance:    {comparison.mean_tv:.4f}")
+    print(f"    Mean coverage:       {comparison.mean_coverage:.2%}")
+    print(f"    Mode match rate:     {comparison.mode_match_rate:.2%}")
+
+    # Per-field details
+    print("\n  Per-field comparison:")
+    for name, comp in sorted(comparison.field_comparisons.items()):
+        match = "Y" if comp.mode_match else "N"
+        print(f"    {name}: KL={comp.kl_divergence:.3f} TV={comp.total_variation:.3f} mode_match={match}")
+
+    # === ALL-SAMPLES METRICS (Fair Comparison) ===
+    # For TCT, all_texts contains valid JSON from decode/decode_prefix
+    # No repair needed since TCT decoder produces valid structure
+    print(f"\n  Extracting from ALL {len(all_texts)} samples...")
+
+    # Filter out empty strings (failed decodes)
+    all_texts_nonempty = [t for t in all_texts if t and t != "{}"]
+    if normalize_json_output:
+        all_texts_nonempty = [normalize_json(t) for t in all_texts_nonempty]
+
+    print(f"  Non-empty decoded samples: {len(all_texts_nonempty)}/{len(all_texts)}")
+
+    # Extract fields from all non-empty samples
+    gen_result_all = extractor.extract_from_samples(all_texts_nonempty)
+    print(f"  All-samples extraction: {gen_result_all.num_valid}/{gen_result_all.num_samples} valid")
+
+    # Compare using all extracted fields
+    comparison_all = compare_extraction_results(real_result, gen_result_all)
+
+    print(f"\n  ALL-SAMPLES Distribution Comparison:")
+    print(f"    Mean KL divergence:  {comparison_all.mean_kl:.4f}")
+    print(f"    Mean TV distance:    {comparison_all.mean_tv:.4f}")
+    print(f"    Mean coverage:       {comparison_all.mean_coverage:.2%}")
+    print(f"    Mode match rate:     {comparison_all.mode_match_rate:.2%}")
+
+    # Verification assertions
+    assert len(all_texts) == gen_stats["total"], \
+        f"all_texts doesn't match generation total: {len(all_texts)} vs {gen_stats['total']}"
+
+    return {
+        "schema": schema,
+        "model_type": "tct",
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "validation_samples": real_result.num_valid,
+        "generated_samples": gen_result.num_valid,
+        "generation_stats": gen_stats,
+        "ground_truth_distributions": real_result.to_dict()["field_distributions"],
+        "generated_distributions": gen_result.to_dict()["field_distributions"],
+        "comparison": comparison.to_dict(),
+        # New: all-samples metrics for fair comparison
+        "all_samples_comparison": comparison_all.to_dict(),
+        "all_samples_nonempty": len(all_texts_nonempty),
+        "all_samples_total": len(all_texts),
+        "all_samples_valid": gen_result_all.num_valid,
+    }
+
+
+def run_generation_quality_utf8_raw(
+    model,
+    schema: str,
+    merge_table: Path,
+    validation_tokens: List[List[int]],
+    num_samples: int,
+    device: str,
+    temperature: float = 0.3,
+    top_k: int = None,
+    top_p: float = 0.9,
+    max_tokens: int = 2048,
+    normalize_json_output: bool = True,
+) -> Dict[str, Any]:
+    """Run generation quality evaluation for UTF8-BPE model WITHOUT XGrammar.
+
+    This shows raw model output without any grammar constraints.
+
+    Args:
+        validation_tokens: Pre-filtered validation token sequences (same as used for BPB)
+        num_samples: Number of samples to generate
+    """
+    from nanochat.field_extractors import get_extractor
+    from nanochat.distribution_metrics import compare_extraction_results
+    from nanochat.xgrammar_tokenizer import UTF8BPEDecoder
+
+    print("\n" + "=" * 60)
+    print("GENERATION QUALITY EVALUATION (UTF8-BPE RAW - No XGrammar)")
+    print("=" * 60)
+
+    # Get field extractor
+    extractor = get_extractor(schema)
+    print(f"  Schema: {schema}")
+    print(f"  Fields defined: {len(extractor.field_definitions)}")
+
+    # Build decoder
+    utf8_decoder = UTF8BPEDecoder(merge_table)
+
+    # Decode ALL validation samples for ground truth distribution (best estimate of true distribution)
+    # Strip BOS token before decoding (get_validation_sequences prepends it)
+    bos_token_id = utf8_decoder.eos_token_id()
+    print(f"\n  Extracting ground truth distribution from {len(validation_tokens)} validation samples...")
+    val_texts = [utf8_decoder.decode(tokens[1:] if tokens and tokens[0] == bos_token_id else tokens)
+                 for tokens in validation_tokens]
+
+    if normalize_json_output:
+        val_texts = [normalize_json(t) for t in val_texts]
+
+    real_result = extractor.extract_from_samples(val_texts)
+    print(f"  Validation samples: {real_result.num_valid}/{real_result.num_samples} valid")
+
+    # Generate samples from model (no grammar constraints, starts from BOS token)
+    print(f"\n  Generating {num_samples} samples WITHOUT grammar constraints...")
+    generated_texts, gen_stats = generate_samples_utf8_raw(
+        model=model,
+        utf8_decoder=utf8_decoder,
+        num_samples=num_samples,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
+        show_progress=True,
+    )
+
+    if normalize_json_output:
+        generated_texts = [normalize_json(t) for t in generated_texts]
+
+    # Extract fields from generated samples
+    print(f"\n  Extracting fields from {len(generated_texts)} generated samples...")
+    gen_result = extractor.extract_from_samples(generated_texts)
+    print(f"  Generated samples: {gen_result.num_valid}/{gen_result.num_samples} valid")
+
+    # Compare distributions (if we have any valid samples)
+    if gen_result.num_valid > 0:
+        print("\n  Comparing distributions...")
+        comparison = compare_extraction_results(real_result, gen_result)
+
+        print(f"\n  Distribution Comparison Summary:")
+        print(f"    Mean KL divergence:  {comparison.mean_kl:.4f}")
+        print(f"    Mean TV distance:    {comparison.mean_tv:.4f}")
+        print(f"    Mean coverage:       {comparison.mean_coverage:.2%}")
+        print(f"    Mode match rate:     {comparison.mode_match_rate:.2%}")
+
+        comparison_dict = comparison.to_dict()
+    else:
+        print("\n  No valid samples generated - cannot compare distributions")
+        comparison_dict = {"mean_kl": float('inf'), "mean_tv": 1.0, "mean_coverage": 0.0, "mode_match_rate": 0.0}
+
+    return {
+        "schema": schema,
+        "model_type": "utf8_raw",
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "validation_samples": real_result.num_valid,
+        "generated_samples": gen_result.num_valid,
+        "generation_stats": gen_stats,
+        "ground_truth_distributions": real_result.to_dict()["field_distributions"],
+        "generated_distributions": gen_result.to_dict()["field_distributions"],
+        "comparison": comparison_dict,
+    }
+
+
+def generate_latex_tables(results: Dict[str, Any], output_dir: Optional[Path] = None) -> str:
+    """Generate LaTeX tables from evaluation results.
+
+    Returns:
+        LaTeX string with all tables
+    """
+    lines = []
+    has_tct = "tct_bpb" in results or "tct_generation" in results
+
+    # Table 1: BPB Comparison (TCT vs UTF8)
+    if "utf8_constrained_bpb" in results or "tct_bpb" in results:
+        lines.extend([
+            "% Table 1: BPB Comparison (TCT vs UTF8+XGrammar)",
+            "\\begin{table}[h]",
+            "\\centering",
+            "\\caption{Bits-per-byte comparison: TCT vs UTF8-BPE with grammar constraints}",
+            "\\label{tab:bpb-comparison}",
+        ])
+
+        if has_tct:
+            lines.extend([
+                "\\begin{tabular}{lrrrr}",
+                "\\toprule",
+                "Schema & TCT BPB & UTF8 Raw & UTF8 Constrained & Reduction \\\\",
+                "\\midrule",
+            ])
+            tct_bpb = results.get("tct_bpb", {}).get("bpb", "-")
+            utf8_bpb = results.get("utf8_constrained_bpb", {})
+            raw = utf8_bpb.get("raw_bpb", "-")
+            constrained = utf8_bpb.get("constrained_bpb", "-")
+            reduction = utf8_bpb.get("bpb_reduction_percent", "-")
+
+            tct_str = f"{tct_bpb:.4f}" if isinstance(tct_bpb, (int, float)) else "-"
+            raw_str = f"{raw:.4f}" if isinstance(raw, (int, float)) else "-"
+            constrained_str = f"{constrained:.4f}" if isinstance(constrained, (int, float)) else "-"
+            reduction_str = f"{reduction:.1f}\\%" if isinstance(reduction, (int, float)) else "-"
+
+            lines.append(f"{results['schema']} & {tct_str} & {raw_str} & {constrained_str} & {reduction_str} \\\\")
+        else:
+            bpb = results["utf8_constrained_bpb"]
+            lines.extend([
+                "\\begin{tabular}{lrrr}",
+                "\\toprule",
+                "Schema & Raw BPB & Constrained BPB & Reduction \\\\",
+                "\\midrule",
+                f"{results['schema']} & {bpb['raw_bpb']:.4f} & {bpb['constrained_bpb']:.4f} & {bpb['bpb_reduction_percent']:.1f}\\% \\\\",
+            ])
+
+        lines.extend([
+            "\\bottomrule",
+            "\\end{tabular}",
+            "\\end{table}",
+            "",
+        ])
+
+    # Table 2: Generation Quality Comparison (TCT vs UTF8+XGrammar)
+    if "utf8_generation" in results or "tct_generation" in results:
+        utf8_comp = results.get("utf8_generation", {}).get("comparison", {})
+        tct_comp = results.get("tct_generation", {}).get("comparison", {})
+
+        lines.extend([
+            "% Table 2: Generation Quality Comparison",
+            "\\begin{table}[h]",
+            "\\centering",
+            "\\caption{Generation quality metrics: TCT vs UTF8+XGrammar}",
+            "\\label{tab:generation-comparison}",
+        ])
+
+        if has_tct:
+            lines.extend([
+                "\\begin{tabular}{lrr}",
+                "\\toprule",
+                "Metric & UTF8+XGrammar & TCT \\\\",
+                "\\midrule",
+                f"Mean KL Divergence & {utf8_comp.get('mean_kl', 0):.4f} & {tct_comp.get('mean_kl', 0):.4f} \\\\",
+                f"Mean TV Distance & {utf8_comp.get('mean_tv', 0):.4f} & {tct_comp.get('mean_tv', 0):.4f} \\\\",
+                f"Coverage & {utf8_comp.get('mean_coverage', 0) * 100:.1f}\\% & {tct_comp.get('mean_coverage', 0) * 100:.1f}\\% \\\\",
+                f"Mode Match Rate & {utf8_comp.get('mode_match_rate', 0) * 100:.1f}\\% & {tct_comp.get('mode_match_rate', 0) * 100:.1f}\\% \\\\",
+                "\\bottomrule",
+                "\\end{tabular}",
+                "\\end{table}",
+                "",
+            ])
+        else:
+            # Single model table (original format)
+            gen = results.get("utf8_generation", results.get("tct_generation", {}))
+            comp = gen.get("comparison", {})
+            model_type = gen.get("model_type", "unknown")
+
+            lines.extend([
+                "\\begin{tabular}{lr}",
+                "\\toprule",
+                "Metric & Value \\\\",
+                "\\midrule",
+                f"Model Type & {model_type} \\\\",
+                f"Mean KL Divergence & {comp.get('mean_kl', 0):.4f} \\\\",
+                f"Mean TV Distance & {comp.get('mean_tv', 0):.4f} \\\\",
+                f"Coverage & {comp.get('mean_coverage', 0) * 100:.1f}\\% \\\\",
+                f"Mode Match Rate & {comp.get('mode_match_rate', 0) * 100:.1f}\\% \\\\",
+                "\\bottomrule",
+                "\\end{tabular}",
+                "\\end{table}",
+                "",
+            ])
+
+    # Table 3: Per-Field Distribution Comparison (if both models present)
+    if has_tct and "utf8_generation" in results and "tct_generation" in results:
+        utf8_fields = results["utf8_generation"].get("comparison", {}).get("field_comparisons", {})
+        tct_fields = results["tct_generation"].get("comparison", {}).get("field_comparisons", {})
+
+        # Get all field names
+        all_fields = set(utf8_fields.keys()) | set(tct_fields.keys())
+
+        if all_fields:
+            lines.extend([
+                "% Table 3: Per-Field Distribution Comparison",
+                "\\begin{table}[h]",
+                "\\centering",
+                "\\caption{Per-field KL divergence comparison (lower is better)}",
+                "\\label{tab:field-comparison}",
+                "\\begin{tabular}{lrr}",
+                "\\toprule",
+                "Field & UTF8+XGrammar & TCT \\\\",
+                "\\midrule",
+            ])
+
+            for name in sorted(all_fields):
+                utf8_kl = utf8_fields.get(name, {}).get("kl_divergence", "-")
+                tct_kl = tct_fields.get(name, {}).get("kl_divergence", "-")
+                utf8_str = f"{utf8_kl:.3f}" if isinstance(utf8_kl, (int, float)) else "-"
+                tct_str = f"{tct_kl:.3f}" if isinstance(tct_kl, (int, float)) else "-"
+                lines.append(f"{name.replace('_', '\\_')} & {utf8_str} & {tct_str} \\\\")
+
+            # Add mean row
+            utf8_mean = results["utf8_generation"].get("comparison", {}).get("mean_kl", 0)
+            tct_mean = results["tct_generation"].get("comparison", {}).get("mean_kl", 0)
+            lines.extend([
+                "\\midrule",
+                f"\\textbf{{Mean}} & \\textbf{{{utf8_mean:.3f}}} & \\textbf{{{tct_mean:.3f}}} \\\\",
+                "\\bottomrule",
+                "\\end{tabular}",
+                "\\end{table}",
+                "",
+            ])
+
+    # Table for single-model field distribution (if only one model)
+    elif "utf8_generation" in results and "comparison" in results["utf8_generation"] and not has_tct:
+        comp = results["utf8_generation"]["comparison"]
+        field_comps = comp.get("field_comparisons", {})
+
+        lines.extend([
+            "% Table 3: Field Distribution Comparison",
+            "\\begin{table}[h]",
+            "\\centering",
+            "\\caption{Field value distribution comparison (generated vs validation)}",
+            "\\label{tab:field-distribution}",
+            "\\begin{tabular}{lrrrr}",
+            "\\toprule",
+            "Field & KL Div. & TV Dist. & Coverage & Mode Match \\\\",
+            "\\midrule",
+        ])
+
+        for name, fc in sorted(field_comps.items()):
+            match = "\\checkmark" if fc.get("mode_match", False) else ""
+            coverage = fc.get("coverage", 0) * 100
+            lines.append(
+                f"{name.replace('_', '\\_')} & {fc.get('kl_divergence', 0):.3f} & "
+                f"{fc.get('total_variation', 0):.3f} & {coverage:.0f}\\% & {match} \\\\"
+            )
+
+        lines.extend([
+            "\\midrule",
+            f"\\textbf{{Mean}} & \\textbf{{{comp.get('mean_kl', 0):.3f}}} & "
+            f"\\textbf{{{comp.get('mean_tv', 0):.3f}}} & "
+            f"\\textbf{{{comp.get('mean_coverage', 0) * 100:.0f}\\%}} & "
+            f"\\textbf{{{comp.get('mode_match_rate', 0) * 100:.0f}\\%}} \\\\",
+            "\\bottomrule",
+            "\\end{tabular}",
+            "\\end{table}",
+            "",
+        ])
+
+    latex_str = "\n".join(lines)
+
+    # Optionally save to file
+    if output_dir:
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        latex_path = output_dir / f"{results.get('schema', 'results')}_tables.tex"
+        with open(latex_path, "w") as f:
+            f.write(latex_str)
+        print(f"  LaTeX tables saved to: {latex_path}")
+
+    return latex_str
+
+
+def debug_xgrammar_generation(
+    merge_table: Path,
+    schema: str,
+    utf8_checkpoint: str,
+    device: str,
+    num_samples: int,
+    random_model: bool,
+    vocab_size: int,
+):
+    """Debug XGrammar generation step by step to find the ~50% failure bug."""
+    import torch
+    import torch.nn.functional as F
+    import xgrammar
+    import json
+    from nanochat.engine import KVCache
+    from nanochat.xgrammar_tokenizer import (
+        UTF8BPEDecoder,
+        build_xgrammar_tokenizer_info,
+        compile_json_schema_grammar,
+        load_schema,
+    )
+
+    # Parameters (match eval_icml defaults)
+    max_tokens = 2048  # Match eval_icml default
+    temperature = 0.3
+    top_p = 0.9
+    batch_size = num_samples  # Test as single batch first
+
+    print(f"\n1. SETUP")
+    print(f"   batch_size={batch_size}, max_tokens={max_tokens}")
+    print(f"   temperature={temperature}, top_p={top_p}")
+
+    # Load model
+    print(f"\n2. LOADING MODEL")
+    if random_model:
+        print("   Creating random model...")
+        model, config = create_random_model(vocab_size, device)
+    else:
+        print(f"   Loading from {utf8_checkpoint}...")
+        model, config = load_model(Path(utf8_checkpoint), device)
+    print(f"   vocab_size={config.get('vocab_size')}, n_layer={config.get('n_layer')}")
+
+    # Setup XGrammar
+    print(f"\n3. XGRAMMAR SETUP")
+    utf8_decoder = UTF8BPEDecoder(merge_table)
+    tokenizer_info = build_xgrammar_tokenizer_info(merge_table)
+    schema_dict = load_schema(schema)
+    compiled_grammar = compile_json_schema_grammar(tokenizer_info, schema_dict)
+    print(f"   tokenizer vocab_size={tokenizer_info.vocab_size}")
+
+    # KV cache params
+    model_cfg = config.get("model_config", config)
+    kv_kwargs = {
+        "num_heads": model_cfg.get("n_kv_head", model_cfg.get("n_head")),
+        "head_dim": model_cfg.get("n_embd") // model_cfg.get("n_head"),
+        "num_layers": model_cfg.get("n_layer"),
+    }
+    bos_token = utf8_decoder.vocab_size() - 1
+    print(f"   bos_token={bos_token}")
+
+    # Create matchers and bitmasks
+    print(f"\n4. CREATING MATCHERS")
+    matchers = [xgrammar.GrammarMatcher(compiled_grammar, terminate_without_stop_token=True)
+                for _ in range(batch_size)]
+    bitmasks = [xgrammar.allocate_token_bitmask(1, tokenizer_info.vocab_size)
+               for _ in range(batch_size)]
+    print(f"   Created {len(matchers)} matchers")
+
+    # Create KV cache
+    kv_cache = KVCache(batch_size=batch_size, seq_len=max_tokens + 1, **kv_kwargs)
+
+    # Initialize state
+    batch_tokens = [[] for _ in range(batch_size)]
+    active = [True] * batch_size
+    terminated = [False] * batch_size
+
+    # Prefill
+    print(f"\n5. PREFILL")
+    input_ids = torch.full((batch_size, 1), bos_token, device=device)
+    with torch.no_grad():
+        logits = model(input_ids, kv_cache=kv_cache)
+        logits = logits[:, -1, :]
+    print(f"   logits shape: {logits.shape}")
+    print(f"   logits range: [{logits.min().item():.2f}, {logits.max().item():.2f}]")
+
+    # Track issues
+    accept_failures = []
+    mask_issues = []
+
+    print(f"\n6. GENERATION LOOP (showing first 10 steps)")
+    for step in range(max_tokens):
+        if not any(active):
+            print(f"   Step {step}: All samples terminated")
+            break
+
+        show_debug = step < 10  # Show first 10 steps in detail
+
+        if show_debug:
+            print(f"\n   === Step {step} ===")
+            print(f"   Active: {[i for i in range(batch_size) if active[i]]}")
+
+        # PHASE 1: Apply grammar masks
+        logits_before_mask = logits.clone()
+        for i in range(batch_size):
+            if active[i]:
+                if matchers[i].is_terminated():
+                    active[i] = False
+                    terminated[i] = True
+                    if show_debug:
+                        print(f"   Sample {i}: TERMINATED")
+                    continue
+
+                # Reset and fill bitmask
+                xgrammar.reset_token_bitmask(bitmasks[i])
+                matchers[i].fill_next_token_bitmask(bitmasks[i])
+
+                # Apply mask
+                logits_i = logits[i:i+1, :]
+                xgrammar.apply_token_bitmask_inplace(logits_i, bitmasks[i].to(device))
+
+                # Count valid tokens
+                num_masked = (logits[i] == float('-inf')).sum().item()
+                num_valid = logits.shape[1] - num_masked
+
+                if show_debug:
+                    print(f"   Sample {i}: {num_valid} valid, {num_masked} masked")
+
+                if num_valid == 0:
+                    print(f"   WARNING: Sample {i} has NO valid tokens at step {step}!")
+                    mask_issues.append((step, i, "no_valid_tokens"))
+
+        # Store logits after mask but before temperature
+        logits_after_mask = logits.clone()
+
+        # PHASE 2: Apply temperature
+        logits_id_before = id(logits)
+        if temperature > 0:
+            logits = logits / temperature
+        logits_id_after = id(logits)
+
+        if show_debug:
+            print(f"   Temperature: tensor id changed: {logits_id_before != logits_id_after}")
+            # Verify -inf preserved
+            for i in range(batch_size):
+                if active[i]:
+                    num_inf_before = (logits_after_mask[i] == float('-inf')).sum().item()
+                    num_inf_after = (logits[i] == float('-inf')).sum().item()
+                    if num_inf_before != num_inf_after:
+                        print(f"   ERROR: Sample {i} lost {num_inf_before - num_inf_after} -inf values!")
+                        mask_issues.append((step, i, "lost_inf_after_temp"))
+
+        # PHASE 3: Apply top-p
+        if top_p is not None and top_p < 1.0:
+            sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+            cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+            sorted_indices_to_remove = cumulative_probs > top_p
+            sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
+            sorted_indices_to_remove[:, 0] = False
+            indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+            logits[indices_to_remove] = float('-inf')
+
+            if show_debug:
+                for i in range(batch_size):
+                    if active[i]:
+                        num_valid_after_topp = (logits[i] != float('-inf')).sum().item()
+                        print(f"   Sample {i}: {num_valid_after_topp} valid after top-p")
+
+        # PHASE 4: Sample
+        probs = F.softmax(logits, dim=-1)
+
+        # Check for NaN
+        if torch.isnan(probs).any():
+            print(f"   WARNING: NaN in probs at step {step}!")
+            for i in range(batch_size):
+                if torch.isnan(probs[i]).any():
+                    num_valid = (logits[i] != float('-inf')).sum().item()
+                    print(f"   Sample {i}: NaN probs, {num_valid} valid tokens")
+                    mask_issues.append((step, i, "nan_probs"))
+
+        next_tokens = torch.multinomial(probs, num_samples=1)
+        next_tokens_list = next_tokens.squeeze(-1).tolist()
+
+        # PHASE 5: Accept tokens and CHECK RETURN VALUE
+        for i, tok in enumerate(next_tokens_list):
+            if active[i]:
+                # Check if token was valid BEFORE accepting
+                was_valid_after_mask = logits_after_mask[i, tok] != float('-inf')
+
+                result = matchers[i].accept_token(tok)
+
+                if show_debug:
+                    print(f"   Sample {i}: token={tok}, was_valid={was_valid_after_mask.item()}, accept={result}")
+
+                if not result:
+                    print(f"   ACCEPT FAILED: step={step}, sample={i}, token={tok}, was_valid={was_valid_after_mask.item()}")
+                    accept_failures.append((step, i, tok, was_valid_after_mask.item()))
+
+                batch_tokens[i].append(tok)
+
+        # PHASE 6: Get next logits
+        with torch.no_grad():
+            logits = model(next_tokens, kv_cache=kv_cache)
+            logits = logits[:, -1, :]
+
+    # Results
+    print(f"\n7. RESULTS")
+    print(f"   {'Sample':<8} {'Status':<15} {'Terminated':<12} {'Tokens':<8}")
+    print(f"   {'-'*45}")
+
+    valid_count = 0
+    for i, tokens in enumerate(batch_tokens):
+        try:
+            text = utf8_decoder.decode(tokens)
+            parsed = json.loads(text)
+            if parsed and parsed != {}:
+                status = "VALID"
+                valid_count += 1
+            else:
+                status = "EMPTY"
+        except json.JSONDecodeError as e:
+            status = f"JSON_ERR"
+            # Show first part of invalid output
+            try:
+                text = utf8_decoder.decode(tokens)
+                print(f"\n   Sample {i} FAILED JSON - first 200 chars:")
+                print(f"   {text[:200]}")
+            except:
+                print(f"   Sample {i}: decode also failed")
+        except Exception as e:
+            status = f"ERROR"
+
+        print(f"   {i:<8} {status:<15} {str(terminated[i]):<12} {len(tokens):<8}")
+
+    print(f"\n8. SUMMARY")
+    print(f"   Valid: {valid_count}/{batch_size} ({100*valid_count/batch_size:.0f}%)")
+    print(f"   Accept failures: {len(accept_failures)}")
+    print(f"   Mask issues: {len(mask_issues)}")
+
+    if accept_failures:
+        print(f"\n   Accept failures detail:")
+        for step, sample, tok, was_valid in accept_failures[:10]:
+            print(f"   step={step}, sample={sample}, token={tok}, was_valid_after_mask={was_valid}")
+
+    if mask_issues:
+        print(f"\n   Mask issues detail:")
+        for step, sample, issue in mask_issues[:10]:
+            print(f"   step={step}, sample={sample}, issue={issue}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="ICML 2026 Evaluation: TCT vs BPE+XGrammar",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+
+    # Model options
+    parser.add_argument("--model_size", type=str,
+                        choices=["tiny", "mini", "base", "small", "medium"],
+                        help="Model size (auto-detects checkpoint paths)")
+    parser.add_argument("--tct_checkpoint", type=str, help="TCT model checkpoint directory (overrides auto-detect)")
+    parser.add_argument("--utf8_checkpoint", type=str, help="UTF8-BPE model checkpoint directory (overrides auto-detect)")
+    parser.add_argument("--tct_epoch", type=int, help="TCT checkpoint epoch (default: latest)")
+    parser.add_argument("--utf8_epoch", type=int, help="UTF8 checkpoint epoch (default: latest)")
+    parser.add_argument("--random_model", action="store_true", help="Use random model for testing")
+    parser.add_argument("--checkpoint_base", type=str, help="Base directory for checkpoints (default: checkpoints/)")
+
+    # Schema options
+    parser.add_argument("--schema", type=str, required=True,
+                        choices=["tsconfig", "eslintrc", "kubernetes"],
+                        help="Schema to evaluate")
+
+    # Data options
+    parser.add_argument("--data_dir", type=str, help="Data directory (auto-detect if not specified)")
+    parser.add_argument("--merge_table", type=str, help="BPE merge table (auto-detect if not specified)")
+
+    # Evaluation options - what to run
+    parser.add_argument("--bpb_only", action="store_true",
+                        help="Only run BPB evaluation (skip generation quality)")
+    parser.add_argument("--generation_only", action="store_true",
+                        help="Only run generation quality evaluation (skip BPB)")
+    parser.add_argument("--num_samples", type=int, default=None,
+                        help="Number of samples for BPB evaluation (default: all validation samples)")
+    parser.add_argument("--num_gen_samples", type=int, default=10000,
+                        help="Number of samples to generate for distribution comparison (default: 10000)")
+    parser.add_argument("--max_seq_len", type=int, default=2048,
+                        help="Maximum sequence length for BPB evaluation (default: 2048, training length)")
+    parser.add_argument("--max_gen_tokens", type=int, default=2048,
+                        help="Maximum tokens per generated sample")
+    parser.add_argument("--temperature", type=float, nargs='+', default=[0.1, 0.3, 0.5],
+                        help="Sampling temperature(s) for generation (multiple for statistical robustness)")
+    parser.add_argument("--top_k", type=int, default=None,
+                        help="Top-k sampling parameter (default: None, use top_p instead)")
+    parser.add_argument("--top_p", type=float, default=0.9,
+                        help="Top-p (nucleus) sampling parameter (0.9 recommended)")
+    parser.add_argument("--normalize_bytes", action="store_true", default=True,
+                        help="Normalize bytes to minified JSON for fair comparison (default: True)")
+    parser.add_argument("--no_normalize_bytes", dest="normalize_bytes", action="store_false",
+                        help="Disable byte normalization (use raw decoded bytes)")
+
+    # Output options
+    parser.add_argument("--output", type=str, help="Output JSON file for results")
+    parser.add_argument("--latex", action="store_true", help="Generate LaTeX tables")
+    parser.add_argument("--latex_dir", type=str, help="Directory for LaTeX output (default: same as --output)")
+    parser.add_argument("--device", type=str, default="cuda",
+                        help="Device to run on (cuda/cpu)")
+    parser.add_argument("--debug_xgrammar", action="store_true",
+                        help="Debug XGrammar generation step-by-step")
+    parser.add_argument("--debug_samples", type=int, default=8,
+                        help="Number of samples for debug mode (default: 8)")
+    parser.add_argument("--skip_raw_generation", action="store_true",
+                        help="Skip raw generation before XGrammar (for debugging)")
+    parser.add_argument("--batch_size", type=int, default=None,
+                        help="Force specific batch size for generation (default: auto)")
+
+    args = parser.parse_args()
+
+    # Set up logging (to file and console)
+    output_path = Path(args.output) if args.output else None
+    log_path = setup_logging(output_path)
+
+    # Validate conflicting options
+    if args.bpb_only and args.generation_only:
+        log("ERROR: Cannot use both --bpb_only and --generation_only")
+        sys.exit(1)
+
+    # Auto-detect checkpoint paths from model_size if provided
+    checkpoint_base = Path(args.checkpoint_base) if args.checkpoint_base else None
+
+    if args.model_size:
+        # Auto-detect both checkpoints
+        if not args.tct_checkpoint:
+            try:
+                args.tct_checkpoint = str(find_checkpoint_dir(args.schema, "tct", args.model_size, checkpoint_base))
+                log(f"Auto-detected TCT checkpoint: {args.tct_checkpoint}")
+            except FileNotFoundError as e:
+                log(f"Warning: Could not find TCT checkpoint: {e}")
+
+        if not args.utf8_checkpoint:
+            try:
+                args.utf8_checkpoint = str(find_checkpoint_dir(args.schema, "utf8", args.model_size, checkpoint_base))
+                log(f"Auto-detected UTF8 checkpoint: {args.utf8_checkpoint}")
+            except FileNotFoundError as e:
+                log(f"Warning: Could not find UTF8 checkpoint: {e}")
+
+    # Validate arguments
+    if not args.random_model and not args.tct_checkpoint and not args.utf8_checkpoint:
+        log("ERROR: Must specify --model_size, or --tct_checkpoint/--utf8_checkpoint, or --random_model")
+        sys.exit(1)
+
+    # Find merge table and data directories
+    merge_table = Path(args.merge_table) if args.merge_table else find_merge_table(args.schema)
+    utf8_data_dir = Path(args.data_dir) if args.data_dir else find_data_dir(args.schema, "utf8")
+
+    log("=" * 60)
+    log("ICML 2026 EVALUATION: TCT vs BPE+XGrammar")
+    log("=" * 60)
+    log(f"Log file: {log_path}")
+
+    # Log versions for reproducibility
+    try:
+        from importlib.metadata import version as pkg_version
+        xgrammar_version = pkg_version("xgrammar")
+    except Exception:
+        xgrammar_version = "unknown"
+    import torch
+    print(f"XGrammar:    {xgrammar_version}")
+    print(f"PyTorch:     {torch.__version__}")
+    print(f"Schema:      {args.schema}")
+    print(f"Merge table: {merge_table}")
+    print(f"UTF8 data:   {utf8_data_dir}")
+    print(f"Samples:     {args.num_samples}")
+    print(f"Device:      {args.device}")
+    print(f"Normalize bytes: {args.normalize_bytes} (minified JSON for fair comparison)")
+
+    results = {
+        "schema": args.schema,
+        "num_samples": args.num_samples,
+        "max_seq_len": args.max_seq_len,
+        "normalize_bytes": args.normalize_bytes,
+        "merge_table": str(merge_table),
+        "utf8_data_dir": str(utf8_data_dir),
+    }
+
+    # Load UTF8-BPE decoder for vocab size
+    from nanochat.xgrammar_tokenizer import UTF8BPEDecoder
+    utf8_decoder = UTF8BPEDecoder(merge_table)
+    vocab_size = utf8_decoder.vocab_size()
+
+    # Debug XGrammar mode - run detailed step-by-step debugging
+    if args.debug_xgrammar:
+        print("\n" + "=" * 60)
+        print("DEBUG XGRAMMAR MODE")
+        print("=" * 60)
+        debug_xgrammar_generation(
+            merge_table=merge_table,
+            schema=args.schema,
+            utf8_checkpoint=args.utf8_checkpoint,
+            device=args.device,
+            num_samples=args.debug_samples,
+            random_model=args.random_model,
+            vocab_size=vocab_size,
+        )
+        print("\nDebug complete. Exiting.")
+        sys.exit(0)
+
+    # Try to find TCT data directory
+    tct_data_dir = None
+    if args.tct_checkpoint:
+        try:
+            tct_data_dir = find_data_dir(args.schema, "tct")
+        except FileNotFoundError:
+            pass
+
+    # Pre-load validation tokens
+    if args.num_samples is None:
+        print(f"\n  Loading validation data (all available samples)...")
+    else:
+        print(f"\n  Loading validation data (target: {args.num_samples} samples)...")
+    utf8_validation_tokens, tct_validation_tokens, valid_indices = load_validation_tokens_with_target(
+        utf8_data_dir=utf8_data_dir,
+        tct_data_dir=tct_data_dir,
+        target_valid=args.num_samples,
+        max_seq_len=args.max_seq_len,
+    )
+    print(f"  UTF8 validation tokens: {len(utf8_validation_tokens)} samples")
+    if tct_validation_tokens:
+        print(f"  TCT validation tokens: {len(tct_validation_tokens)} samples")
+        results["tct_data_dir"] = str(tct_data_dir)
+
+    results["num_valid_samples"] = len(utf8_validation_tokens)
+    results["num_gen_samples"] = args.num_gen_samples
+
+    # Evaluate UTF8-BPE model (with constrained BPB)
+    if args.utf8_checkpoint or args.random_model:
+        print("\n" + "-" * 60)
+        print("UTF8-BPE MODEL")
+        print("-" * 60)
+
+        if args.random_model:
+            print("Creating random model for testing...")
+            model, config = create_random_model(vocab_size, args.device)
+        else:
+            print(f"Loading model from {args.utf8_checkpoint}")
+            model, config = load_model(Path(args.utf8_checkpoint), args.device, args.utf8_epoch)
+
+        print(f"  vocab_size: {config.get('vocab_size')}")
+        print(f"  n_layer: {config.get('n_layer')}")
+
+        # Run constrained BPB (unless --generation_only)
+        if not args.generation_only:
+            bpb_results = run_constrained_bpb(
+                model=model,
+                schema=args.schema,
+                merge_table=merge_table,
+                validation_tokens=utf8_validation_tokens,  # Pre-filtered for fair comparison
+                device=args.device,
+                normalize_bytes=args.normalize_bytes,
+            )
+            results["utf8_constrained_bpb"] = bpb_results
+
+        # Run generation quality (unless --bpb_only)
+        if not args.bpb_only:
+            # Run generation at multiple temperatures for statistical robustness
+            temperatures = args.temperature if isinstance(args.temperature, list) else [args.temperature]
+            results["utf8_raw_generation_by_temp"] = {}
+            results["utf8_generation_by_temp"] = {}
+
+            for temp in temperatures:
+                log(f"\n  === Generation at temperature={temp} ===")
+
+                # Raw UTF8 generation (no grammar constraints)
+                if args.skip_raw_generation:
+                    log("  Skipping raw generation (--skip_raw_generation)")
+                    raw_gen_results = {}
+                else:
+                    raw_gen_results = run_generation_quality_utf8_raw(
+                        model=model,
+                        schema=args.schema,
+                        merge_table=merge_table,
+                        validation_tokens=utf8_validation_tokens,
+                        num_samples=args.num_gen_samples,
+                        device=args.device,
+                        temperature=temp,
+                        top_k=args.top_k,
+                        top_p=args.top_p,
+                        max_tokens=args.max_gen_tokens,
+                        normalize_json_output=args.normalize_bytes,
+                    )
+                results["utf8_raw_generation_by_temp"][temp] = raw_gen_results
+
+                # UTF8 + XGrammar generation (grammar constrained)
+                gen_results = run_generation_quality_utf8(
+                    model=model,
+                    schema=args.schema,
+                    merge_table=merge_table,
+                    validation_tokens=utf8_validation_tokens,
+                    num_samples=args.num_gen_samples,
+                    device=args.device,
+                    temperature=temp,
+                    top_k=args.top_k,
+                    top_p=args.top_p,
+                    max_tokens=args.max_gen_tokens,
+                    normalize_json_output=args.normalize_bytes,
+                    batch_size=args.batch_size,
+                )
+                results["utf8_generation_by_temp"][temp] = gen_results
+
+            # Use middle temperature as the primary result for backward compatibility
+            primary_temp = temperatures[len(temperatures) // 2]
+            results["utf8_raw_generation"] = results["utf8_raw_generation_by_temp"][primary_temp]
+            results["utf8_generation"] = results["utf8_generation_by_temp"][primary_temp]
+
+        # Clean up
+        del model
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    # Evaluate TCT model (generation quality only - no XGrammar needed)
+    if args.tct_checkpoint:
+        from nanochat.xgrammar_tokenizer import get_tct_module, compute_tct_bpb
+
+        print("\n" + "-" * 60)
+        print("TCT MODEL")
+        print("-" * 60)
+
+        # Load TCT module for this schema
+        tct_module = get_tct_module(args.schema)
+        tct_vocab_size = tct_module.vocab_size()
+        print(f"  TCT vocab size: {tct_vocab_size}")
+
+        # Load model
+        print(f"Loading model from {args.tct_checkpoint}")
+        model, full_config = load_model(Path(args.tct_checkpoint), args.device, args.tct_epoch)
+        model_cfg = full_config.get("model_config", full_config)
+        schema_cfg = full_config.get("schema_config", {})
+        print(f"  vocab_size: {model_cfg.get('vocab_size')}")
+        print(f"  n_layer: {model_cfg.get('n_layer')}")
+        print(f"  val_loss: {full_config.get('val_loss', 'N/A')}")
+
+        # Use pre-filtered tct_validation_tokens if available (from fair comparison section)
+        # Otherwise, try to find data dir and load tokens
+        if tct_validation_tokens is None:
+            # Try to find TCT data dir from checkpoint config or discovery
+            tct_data_dir_local = None
+            if schema_cfg.get("data_path_tct"):
+                candidate = Path(schema_cfg["data_path_tct"])
+                if candidate.exists():
+                    tct_data_dir_local = candidate
+                else:
+                    # Try relative to home/Desktop/data with the directory name
+                    data_dir_name = schema_cfg.get("data_dir_tct")
+                    if data_dir_name:
+                        candidate = Path.home() / "Desktop" / "data" / data_dir_name
+                        if candidate.exists():
+                            tct_data_dir_local = candidate
+            if tct_data_dir_local is None:
+                try:
+                    tct_data_dir_local = find_data_dir(args.schema, "tct")
+                except FileNotFoundError:
+                    tct_data_dir_local = None
+
+            if tct_data_dir_local:
+                tct_data_dir = tct_data_dir_local
+                print(f"  TCT data dir: {tct_data_dir}")
+                # Load tokens with auto-increase to match target (TCT-only path)
+                tct_validation_tokens, _, _ = load_validation_tokens_with_target(
+                    utf8_data_dir=tct_data_dir,  # Use TCT path as "utf8" (single tokenizer path)
+                    tct_data_dir=None,  # No second tokenizer
+                    target_valid=args.num_samples,
+                    max_seq_len=args.max_seq_len,
+                )
+                print(f"  TCT validation tokens: {len(tct_validation_tokens)}")
+            else:
+                print(f"  WARNING: No TCT data directory found. TCT BPB cannot be computed.")
+
+        if tct_validation_tokens is not None:
+            print(f"  Using {len(tct_validation_tokens)} pre-filtered TCT validation sequences")
+
+            # Compute TCT BPB (unless --generation_only)
+            if not args.generation_only:
+                print("\n  Computing TCT loss...")
+                tct_bpb_result = compute_tct_bpb(
+                    model=model,
+                    tct_module=tct_module,
+                    validation_tokens=tct_validation_tokens,  # Pre-filtered for fair comparison
+                    device=args.device,
+                    max_seq_len=None,  # Already pre-filtered
+                    show_progress=True,
+                    normalize_bytes=args.normalize_bytes,
+                )
+                tct_loss_per_token = tct_bpb_result.total_loss / tct_bpb_result.total_tokens if tct_bpb_result.total_tokens > 0 else 0
+
+                print(f"\n  TCT Results:")
+                print(f"    Total loss:     {tct_bpb_result.total_loss:.1f} nats")
+                print(f"    Loss/token:     {tct_loss_per_token:.4f} nats")
+                print(f"    Sequences:      {tct_bpb_result.num_sequences}")
+                print(f"    Tokens:         {tct_bpb_result.total_tokens}")
+                print(f"    Bytes:          {tct_bpb_result.total_bytes}")
+
+                results["tct_bpb"] = {
+                    "bpb": tct_bpb_result.bpb,
+                    "loss_per_token": tct_loss_per_token,
+                    "num_sequences": tct_bpb_result.num_sequences,
+                    "total_tokens": tct_bpb_result.total_tokens,
+                    "total_bytes": tct_bpb_result.total_bytes,
+                    "total_loss_nats": tct_bpb_result.total_loss,
+                }
+
+            # Decode ALL TCT validation tokens for ground truth (best estimate of true distribution)
+            # Strip BOS token before decoding (get_validation_sequences prepends it)
+            pad_token_id = tct_module.vocab_size() - 1
+            val_json_strings = []
+            for tokens in tct_validation_tokens:
+                try:
+                    # Strip BOS if present
+                    decode_tokens = tokens[1:] if tokens and tokens[0] == pad_token_id else tokens
+                    json_out, consumed, surplus = tct_module.decode(decode_tokens)
+                    val_json_strings.append(json_out)
+                except Exception:
+                    continue
+        else:
+            print(f"  WARNING: No TCT validation tokens available. Using UTF8 validation data for generation comparison.")
+            # Fallback: use ALL UTF8 validation data decoded for comparison
+            # Strip BOS token before decoding (get_validation_sequences prepends it)
+            bos_token_id = utf8_decoder.eos_token_id()
+            val_json_strings = [utf8_decoder.decode(tokens[1:] if tokens and tokens[0] == bos_token_id else tokens)
+                                for tokens in utf8_validation_tokens]
+
+        # Run generation quality for TCT (unless --bpb_only)
+        if not args.bpb_only:
+            # Run generation at multiple temperatures for statistical robustness
+            temperatures = args.temperature if isinstance(args.temperature, list) else [args.temperature]
+            results["tct_generation_by_temp"] = {}
+
+            for temp in temperatures:
+                log(f"\n  === TCT Generation at temperature={temp} ===")
+                tct_gen_results = run_generation_quality_tct(
+                    model=model,
+                    schema=args.schema,
+                    tct_module=tct_module,
+                    validation_json_strings=val_json_strings,
+                    num_samples=args.num_gen_samples,
+                    temperature=temp,
+                    top_k=args.top_k,
+                    top_p=args.top_p,
+                    max_tokens=args.max_gen_tokens,
+                    normalize_json_output=args.normalize_bytes,
+                )
+                results["tct_generation_by_temp"][temp] = tct_gen_results
+
+            # Use middle temperature as primary result
+            primary_temp = temperatures[len(temperatures) // 2]
+            results["tct_generation"] = results["tct_generation_by_temp"][primary_temp]
+
+        # Clean up
+        del model
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    # Print summary
+    print("\n" + "=" * 60)
+    print("SUMMARY")
+    print("=" * 60)
+
+    # Loss Comparison Table
+    if "utf8_constrained_bpb" in results or "tct_bpb" in results:
+        print("\n  Total Loss Comparison (lower is better):")
+        print(f"  {'Method':<25} {'Loss (nats)':>12} {'Loss/tok':>10} {'Tokens':>10} {'Sequences':>10}")
+        print(f"  {'-'*67}")
+
+        if "utf8_constrained_bpb" in results:
+            utf8 = results["utf8_constrained_bpb"]
+            raw_loss = utf8['raw_loss_nats']
+            raw_loss_per_tok = raw_loss / utf8['total_tokens'] if utf8['total_tokens'] > 0 else 0
+            print(f"  {'UTF8-BPE (raw)':<25} {raw_loss:>12.1f} {raw_loss_per_tok:>10.4f} {utf8['total_tokens']:>10} {utf8['num_sequences']:>10}")
+            constrained_loss = utf8['constrained_loss_nats']
+            constrained_loss_per_tok = constrained_loss / utf8['total_tokens'] if utf8['total_tokens'] > 0 else 0
+            print(f"  {'UTF8-BPE + XGrammar':<25} {constrained_loss:>12.1f} {constrained_loss_per_tok:>10.4f} {utf8['total_tokens']:>10} {utf8['num_sequences']:>10}")
+
+        if "tct_bpb" in results:
+            tct = results["tct_bpb"]
+            tct_loss = tct['total_loss_nats']
+            tct_loss_per_tok = tct['loss_per_token']
+            print(f"  {'TCT':<25} {tct_loss:>12.1f} {tct_loss_per_tok:>10.4f} {tct['total_tokens']:>10} {tct['num_sequences']:>10}")
+
+        # Fairness verification
+        if "utf8_constrained_bpb" in results and "tct_bpb" in results:
+            utf8_bpb = results["utf8_constrained_bpb"]
+            tct_bpb = results["tct_bpb"]
+            print(f"\n  Fairness Verification:")
+            if utf8_bpb['num_sequences'] == tct_bpb['num_sequences']:
+                print(f"    Same number of sequences: {utf8_bpb['num_sequences']}")
+            else:
+                print(f"    WARNING: Different sequence counts: UTF8={utf8_bpb['num_sequences']}, TCT={tct_bpb['num_sequences']}")
+            if utf8_bpb['total_bytes'] == tct_bpb['total_bytes']:
+                print(f"    Same total bytes: {utf8_bpb['total_bytes']}")
+            else:
+                print(f"    WARNING: Different byte counts: UTF8={utf8_bpb['total_bytes']}, TCT={tct_bpb['total_bytes']}")
+
+            # Semantic Value-Only Comparison (position-based, token-normalized)
+            if "semantic_analysis" in utf8_bpb:
+                sc = utf8_bpb["semantic_analysis"]
+                tct_total_loss = tct_bpb.get("total_loss_nats", 0)
+                tct_total_tokens = tct_bpb.get("total_tokens", 0)
+
+                if "value_loss_per_token" in sc:
+                    key_loss_pct = sc.get("key_loss_pct", 0)
+                    value_loss_pct = sc.get("value_loss_pct", 0)
+                    tct_total_loss = tct_bpb.get("total_loss_nats", 0)
+                    tct_total_tokens = tct_bpb.get("total_tokens", 0)
+
+                    print(f"\n  === SEMANTIC VALUE-ONLY COMPARISON ===")
+                    print(f"  (Fairest comparison: avg loss per semantic token)")
+                    print(f"\n    UTF8 Loss Breakdown:")
+                    print(f"      Syntax loss:     {100 - key_loss_pct - value_loss_pct:.1f}% (deterministic)")
+                    print(f"      Key loss:        {key_loss_pct:.1f}% (schema-determined)")
+                    print(f"      Value loss:      {value_loss_pct:.1f}% (semantic content)")
+
+                    # Get metrics
+                    utf8_raw_value_lpt = sc.get("value_loss_per_token", 0)
+                    utf8_constrained_value_lpt = sc.get("constrained_value_loss_per_token", 0)
+                    tct_loss_per_token = (tct_total_loss / tct_total_tokens) if tct_total_tokens > 0 else 0
+                    value_tokens = sc.get("value_tokens", 0)
+
+                    if tct_loss_per_token > 0:
+                        print(f"\n    Value Loss Per Token (semantic content only):")
+                        print(f"      {'Method':<25} {'Loss/tok':>12} {'Ratio':>10}")
+                        print(f"      {'-'*47}")
+                        print(f"      {'UTF8-BPE (raw)':<25} {utf8_raw_value_lpt:>12.4f} {utf8_raw_value_lpt/tct_loss_per_token:>9.2f}x")
+                        print(f"      {'UTF8-BPE + XGrammar':<25} {utf8_constrained_value_lpt:>12.4f} {utf8_constrained_value_lpt/tct_loss_per_token:>9.2f}x")
+                        print(f"      {'TCT':<25} {tct_loss_per_token:>12.4f} {'1.00':>9}x")
+                        print(f"\n      (UTF8: {value_tokens} value tokens, TCT: {tct_total_tokens} tokens)")
+
+                        # Summary
+                        if utf8_constrained_value_lpt > tct_loss_per_token:
+                            improvement = (utf8_constrained_value_lpt / tct_loss_per_token - 1) * 100
+                            print(f"\n    Result: TCT needs {improvement:.0f}% less loss per semantic token than UTF8+XGrammar")
+                        elif utf8_constrained_value_lpt < tct_loss_per_token:
+                            improvement = (1 - utf8_constrained_value_lpt / tct_loss_per_token) * 100
+                            print(f"\n    Result: UTF8+XGrammar needs {improvement:.0f}% less loss per semantic token than TCT")
+
+    if "utf8_generation" in results and "tct_generation" in results:
+        utf8 = results["utf8_generation"].get("comparison", {})
+        tct = results["tct_generation"].get("comparison", {})
+        print(f"\nGeneration Quality Comparison:")
+        print(f"  {'Metric':<20} {'UTF8+XGrammar':>15} {'TCT':>15}")
+        print(f"  {'-'*50}")
+        print(f"  {'Mean KL Divergence':<20} {utf8.get('mean_kl', 0):>15.4f} {tct.get('mean_kl', 0):>15.4f}")
+        print(f"  {'Mean TV Distance':<20} {utf8.get('mean_tv', 0):>15.4f} {tct.get('mean_tv', 0):>15.4f}")
+        print(f"  {'Coverage':<20} {utf8.get('mean_coverage', 0):>14.1%} {tct.get('mean_coverage', 0):>14.1%}")
+        print(f"  {'Mode Match Rate':<20} {utf8.get('mode_match_rate', 0):>14.1%} {tct.get('mode_match_rate', 0):>14.1%}")
+
+        # Throughput comparison
+        utf8_stats = results["utf8_generation"].get("generation_stats", {})
+        tct_stats = results["tct_generation"].get("generation_stats", {})
+        if utf8_stats.get("tokens_per_second") and tct_stats.get("tokens_per_second"):
+            print(f"\nGeneration Throughput:")
+            print(f"  {'Metric':<20} {'UTF8+XGrammar':>15} {'TCT':>15}")
+            print(f"  {'-'*50}")
+            print(f"  {'Tokens/sec':<20} {utf8_stats.get('tokens_per_second', 0):>15.0f} {tct_stats.get('tokens_per_second', 0):>15.0f}")
+            print(f"  {'Samples/sec':<20} {utf8_stats.get('samples_per_second', 0):>15.2f} {tct_stats.get('samples_per_second', 0):>15.2f}")
+            print(f"  {'Time (sec)':<20} {utf8_stats.get('generation_time_seconds', 0):>15.1f} {tct_stats.get('generation_time_seconds', 0):>15.1f}")
+            speedup = tct_stats.get('tokens_per_second', 0) / utf8_stats.get('tokens_per_second', 1) if utf8_stats.get('tokens_per_second', 0) > 0 else 0
+            print(f"  {'TCT Speedup':<20} {speedup:>15.2f}x")
+
+    # Save results
+    if args.output:
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_path, "w") as f:
+            json.dump(results, f, indent=2)
+        print(f"\nResults saved to: {output_path}")
+
+    # Generate LaTeX tables
+    if args.latex:
+        latex_dir = Path(args.latex_dir) if args.latex_dir else (Path(args.output).parent if args.output else Path("."))
+        print("\n" + "=" * 60)
+        print("LATEX TABLES")
+        print("=" * 60)
+        latex_str = generate_latex_tables(results, latex_dir)
+        print("\nGenerated LaTeX:")
+        print(latex_str[:500] + "..." if len(latex_str) > 500 else latex_str)
+
+    print("\nDone!")
+
+
+if __name__ == "__main__":
+    main()

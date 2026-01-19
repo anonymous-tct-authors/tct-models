@@ -1,0 +1,53 @@
+[project]
+name = "nanochat"
+version = "0.1.0"
+description = "the minimal full-stack ChatGPT clone"
+readme = "README.md"
+requires-python = "==3.12.*"
+dependencies = [
+    "datasets>=4.0.0",
+    "fastapi>=0.117.1",
+    "files-to-prompt>=0.6",
+    "jsonschema>=4.20.0",
+    "psutil>=7.1.0",
+    "regex>=2025.9.1",
+    "setuptools>=80.9.0",
+    "tiktoken>=0.11.0",
+    "tokenizers>=0.22.0",
+    "torch>=2.8.0",
+    "transformers>=4.35.0",
+    "uvicorn>=0.36.0",
+    "wandb>=0.21.3",
+    "xgrammar==0.1.29",
+    # Local TCT wheels
+    "tct-eslintrc-bpe-500",
+    "tct-kubernetes-bpe-1k",
+    "tct-tsconfig",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+
+[tool.uv.sources]
+# Local TCT wheels
+tct-eslintrc-bpe-500 = { path = "tct-wheels/tct_eslintrc_bpe_500-1.0.0-cp312-cp312-manylinux_2_34_x86_64.whl" }
+tct-kubernetes-bpe-1k = { path = "tct-wheels/tct_kubernetes_bpe_1k-1.0.0-cp312-cp312-manylinux_2_34_x86_64.whl" }
+tct-tsconfig = { path = "tct-wheels/tct_tsconfig-1.0.0-cp312-cp312-manylinux_2_34_x86_64.whl" }
+# PyTorch with CUDA 12.8 (includes cuDNN)
+torch = { index = "pytorch-cu128" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true  
