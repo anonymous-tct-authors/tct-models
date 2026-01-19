@@ -31,6 +31,19 @@ bash scripts/train.sh kubernetes mini
 bash scripts/eval.sh kubernetes mini
 ```
 
+## Model Checkpoints
+
+Pre-trained model checkpoints are available on HuggingFace:
+
+**https://huggingface.co/anonymous-tct-authors/tct-models**
+
+The `setup.sh` script automatically downloads them. To download manually:
+
+```bash
+pip install huggingface_hub
+python -c "from huggingface_hub import snapshot_download; snapshot_download('anonymous-tct-authors/tct-models', repo_type='model', local_dir='checkpoints')"
+```
+
 ## Project Structure
 
 ```
@@ -44,7 +57,7 @@ tct-models/
 │   ├── eval.sh             # Evaluation launcher
 │   ├── eval_icml.py        # BPB and generation evaluation
 │   └── eval_generation.py  # Generation-only evaluation
-├── checkpoints/            # Trained model weights
+├── checkpoints/            # Trained model weights (downloaded from HuggingFace)
 ├── data/                   # Training data (extracted from .tar.xz)
 ├── bpe-merges/             # BPE merge tables
 ├── schemas/                # JSON schemas for validation
