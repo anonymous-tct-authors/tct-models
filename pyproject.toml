@@ -1,7 +1,7 @@
 [project]
-name = "nanochat"
+name = "tct-models"
 version = "0.1.0"
-description = "the minimal full-stack ChatGPT clone"
+description = "Training and evaluation code for Type-Constrained Tokenization (TCT) language models"
 readme = "README.md"
 requires-python = "==3.12.*"
 dependencies = [
