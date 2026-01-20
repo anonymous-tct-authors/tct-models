@@ -64,6 +64,21 @@ tct-models/
 └── tct-wheels/             # TCT tokenizer wheels
 ```
 
+## Training Data
+
+The repository includes pre-tokenized training data as compressed archives in `data/`. Running `setup.sh` automatically extracts these archives and installs the TCT tokenizer wheels via `uv sync`.
+
+The training data consists of TCT token sequences rather than raw JSON. To recover the original JSON documents, use the `decode` function provided by the installed TCT wheels:
+
+```python
+import tct_kubernetes_bpe_1k as tct
+
+tokens = [0, 3, 105, 110, 99, ...]  # TCT token sequence
+json_text, consumed, surplus = tct.decode(tokens)
+```
+
+Each schema has its own tokenizer wheel (`tct_tsconfig`, `tct_eslintrc_bpe_500`, `tct_kubernetes_bpe_1k`) with encode/decode functionality.
+
 ## Model Sizes
 
 | Size | d_model | Layers | Heads | Parameters |
