@@ -83,11 +83,11 @@ Each schema has its own tokenizer wheel (`tct_tsconfig`, `tct_eslintrc_bpe_500`,
 
 | Size | d_model | Layers | Heads | Parameters |
 |------|---------|--------|-------|------------|
-| tiny | 128 | 4 | 4 | ~5M |
-| mini | 256 | 6 | 8 | ~15M |
-| base | 384 | 8 | 8 | ~35M |
-| small | 512 | 10 | 8 | ~50M |
-| medium | 768 | 12 | 12 | ~125M |
+| tiny | 256 | 6 | 4 | ~5M |
+| mini | 384 | 8 | 6 | ~15M |
+| base | 512 | 10 | 8 | ~35M |
+| small | 512 | 14 | 8 | ~50M |
+| medium | 768 | 16 | 12 | ~125M |
 
 ## Schemas
 
