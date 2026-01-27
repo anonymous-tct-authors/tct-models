@@ -79,6 +79,7 @@ tct-models/
 │   └── eval_generation.py  # Generation-only evaluation
 ├── checkpoints/            # Trained model weights (downloaded from HuggingFace)
 ├── data/                   # Training data (extracted from .tar.xz)
+├── assets/                 # README animations
 ├── bpe-merges/             # BPE merge tables
 ├── schemas/                # JSON schemas for validation
 └── tct-wheels/             # TCT tokenizer wheels

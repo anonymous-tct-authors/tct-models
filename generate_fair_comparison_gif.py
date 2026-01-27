@@ -63,7 +63,7 @@ def create_frame(
     y += 40
 
     # Subtitle
-    draw.text((padding, y), "Same JSON, verified with tiktoken and tct_kubernetes_bpe_1k",
+    draw.text((padding, y), "Same Kubernetes manifest, different tokenizers",
               font=font_small, fill=hex_to_rgb(COLORS['text_dim']))
     y += 30
 
