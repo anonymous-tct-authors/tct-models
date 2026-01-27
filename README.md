@@ -2,6 +2,12 @@
 
 Training and evaluation code for **Type-Constrained Tokenization (TCT)** language models for structured JSON generation.
 
+<p align="center">
+  <img src="assets/tct_animation.gif" alt="TCT Tokenization Animation" width="700">
+</p>
+
+<p align="center"><em>TCT tokens decode progressively to valid JSON at every step</em></p>
+
 This repository contains the accompanying code for the paper:
 
 > **Type-Constrained Tokenization: Enabling Syntax-Free Learning for Structured Generation**
@@ -17,6 +23,20 @@ This repository contains code for training small GPT-style language models that 
 - **ESLint** configuration files
 
 TCT models use schema-aware tokenization that guarantees structurally valid output, compared to standard UTF8-BPE models that require post-hoc constraint enforcement (e.g., XGrammar).
+
+### Why TCT?
+
+<p align="center">
+  <img src="assets/tct_zero_entropy.gif" alt="Zero-Entropy Elimination" width="700">
+</p>
+
+Standard tokenizers force models to predict deterministic syntax (braces, colons, field names). TCT eliminates these **zero-entropy predictions** entirely—models only predict at decision points where genuine choices exist.
+
+<p align="center">
+  <img src="assets/tct_comparison.gif" alt="TCT vs UTF-8 Comparison" width="700">
+</p>
+
+TCT tokens represent meaningful JSON structures rather than raw bytes. Compared to production tokenizers (GPT-4, LLaMA), TCT produces **50-82% fewer tokens** while guaranteeing 100% valid output by construction.
 
 ## Quick Start
 
@@ -93,11 +113,15 @@ Each schema has its own tokenizer wheel (`tct_tsconfig`, `tct_eslintrc_bpe_500`,
 
 Each schema has both TCT and UTF8-BPE tokenized datasets:
 
-| Schema | TCT Vocab | UTF8 Vocab | Context |
-|--------|-----------|------------|---------|
-| kubernetes | 1000 | 1527 | 2048 |
-| tsconfig | 258 | 277 | 2048 |
-| eslintrc | 500 | 717 | 2048 |
+<p align="center">
+  <img src="assets/tct_schemas.gif" alt="TCT Schema Comparison" width="700">
+</p>
+
+| Schema | TCT Vocab | UTF8 Vocab | Reduction | Context |
+|--------|-----------|------------|-----------|---------|
+| Kubernetes | 1,000 | 1,527 | 35% | 2048 |
+| ESLint | 500 | 717 | 30% | 2048 |
+| TSConfig | 258 | 277 | 7% | 2048 |
 
 ## Training
 
