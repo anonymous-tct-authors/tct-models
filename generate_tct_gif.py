@@ -174,11 +174,11 @@ def create_frame(
     draw.line([(padding, stats_y - 10), (width - padding, stats_y - 10)], fill=hex_to_rgb(COLORS['border']), width=1)
 
     # Draw compression comparison
-    if visible_tokens > 0:
+    if visible_tokens > 0 and utf8_byte_count > 0:
         compression = utf8_byte_count / visible_tokens
         stats_text = f"{utf8_byte_count} bytes → {visible_tokens} tokens ({compression:.1f}x compression)"
     else:
-        stats_text = f"{utf8_byte_count} bytes → ? tokens"
+        stats_text = f"? bytes → ? tokens"
 
     draw.text((padding, stats_y), stats_text, font=font_small, fill=hex_to_rgb(COLORS['text_dim']))
 
@@ -303,7 +303,6 @@ def generate_animation(
     font_title = get_font(18)
 
     frames = []
-    byte_count = len(json_str.encode('utf-8'))
 
     # Initial frame (no tokens)
     frame = create_frame(
@@ -315,12 +314,13 @@ def generate_animation(
         "",
         "",
         font, font_small, font_title,
-        byte_count
+        0  # No bytes decoded yet
     )
     frames.append(frame)
 
     # One frame per token
     for i, (decoded, token) in enumerate(decoded_states):
+        decoded_bytes = len(decoded.encode('utf-8')) if decoded else 0
         frame = create_frame(
             width, height,
             "Type-Constrained Tokenization (TCT)",
@@ -330,21 +330,23 @@ def generate_animation(
             decoded or "{}",
             "",
             font, font_small, font_title,
-            byte_count
+            decoded_bytes
         )
         frames.append(frame)
 
     # Final frame (hold longer) - same as last but will be held
+    final_decoded = decoded_states[-1][0] if decoded_states else "{}"
+    final_bytes = len(final_decoded.encode('utf-8')) if final_decoded else 0
     frame = create_frame(
         width, height,
         "Type-Constrained Tokenization (TCT)",
         json_str,
         tokens,
         len(tokens),
-        decoded_states[-1][0] if decoded_states else "{}",
+        final_decoded,
         "",
         font, font_small, font_title,
-        byte_count
+        final_bytes
     )
     frames.append(frame)
 
