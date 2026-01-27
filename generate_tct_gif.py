@@ -308,7 +308,7 @@ def generate_animation(
     # Initial frame (no tokens)
     frame = create_frame(
         width, height,
-        "TCT Tokenization",
+        "Type-Constrained Tokenization (TCT)",
         json_str,
         tokens,
         0,
@@ -323,7 +323,7 @@ def generate_animation(
     for i, (decoded, token) in enumerate(decoded_states):
         frame = create_frame(
             width, height,
-            "TCT Tokenization",
+            "Type-Constrained Tokenization (TCT)",
             json_str,
             tokens,
             i + 1,
@@ -337,7 +337,7 @@ def generate_animation(
     # Final frame (hold longer) - same as last but will be held
     frame = create_frame(
         width, height,
-        "TCT Tokenization",
+        "Type-Constrained Tokenization (TCT)",
         json_str,
         tokens,
         len(tokens),
