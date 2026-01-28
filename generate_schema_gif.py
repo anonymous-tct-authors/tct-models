@@ -57,7 +57,7 @@ def create_frame(
     y = padding
 
     # Title
-    draw.text((padding, y), "TCT Compression by Schema", font=font_title, fill=hex_to_rgb(COLORS['text']))
+    draw.text((padding, y), "TCT Vocabulary Reduction by Schema", font=font_title, fill=hex_to_rgb(COLORS['text']))
     y += 45
 
     # Column headers
@@ -70,7 +70,7 @@ def create_frame(
     draw.text((col_schema, y), "Schema", font=font_small, fill=hex_to_rgb(COLORS['text_dim']))
     draw.text((col_tct, y), "TCT", font=font_small, fill=hex_to_rgb(COLORS['tct']))
     draw.text((col_utf8, y), "UTF-8", font=font_small, fill=hex_to_rgb(COLORS['utf8']))
-    draw.text((col_ratio, y), "Compression", font=font_small, fill=hex_to_rgb(COLORS['text_dim']))
+    draw.text((col_ratio, y), "Reduction", font=font_small, fill=hex_to_rgb(COLORS['text_dim']))
     y += 30
 
     draw.line([(padding, y), (width - padding, y)], fill=hex_to_rgb(COLORS['border']), width=1)
