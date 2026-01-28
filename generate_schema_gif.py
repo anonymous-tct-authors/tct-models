@@ -130,7 +130,7 @@ def create_frame(
     draw.line([(padding, y), (width - padding, y)], fill=hex_to_rgb(COLORS['border']), width=1)
     y += 15
 
-    draw.text((padding, y), "TCT achieves 30-45% smaller vocabularies while guaranteeing valid JSON output",
+    draw.text((padding, y), "TCT guarantees valid JSON output by construction",
               font=font_small, fill=hex_to_rgb(COLORS['text_dim']))
 
     return img
