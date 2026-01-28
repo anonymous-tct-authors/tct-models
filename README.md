@@ -22,7 +22,7 @@ This repository contains code for training small GPT-style language models that 
 - **TSConfig** (TypeScript configuration files)
 - **ESLint** configuration files
 
-TCT models use schema-aware tokenization that guarantees structurally valid output, compared to standard UTF8-BPE models that require post-hoc constraint enforcement (e.g., XGrammar).
+TCT models use schema-aware tokenization that guarantees structurally valid output, compared to standard BPE models that require post-hoc constraint enforcement (e.g., XGrammar).
 
 ### Why TCT?
 
@@ -33,7 +33,7 @@ TCT models use schema-aware tokenization that guarantees structurally valid outp
 Standard tokenizers force models to predict deterministic syntax (braces, colons, field names). TCT eliminates these **zero-entropy predictions** entirely—models only predict at decision points where genuine choices exist.
 
 <p align="center">
-  <img src="assets/tct_comparison.gif" alt="TCT vs UTF-8 Comparison" width="700">
+  <img src="assets/tct_comparison.gif" alt="TCT vs BPE Comparison" width="700">
 </p>
 
 TCT tokens represent meaningful JSON structures rather than raw bytes. Compared to production tokenizers (GPT-4, LLaMA), TCT produces **50-82% fewer tokens** while guaranteeing 100% valid output by construction.
@@ -112,13 +112,13 @@ Each schema has its own tokenizer wheel (`tct_tsconfig`, `tct_eslintrc_bpe_500`,
 
 ## Schemas
 
-Each schema has both TCT and UTF8-BPE tokenized datasets:
+Each schema has both TCT and BPE tokenized datasets:
 
 <p align="center">
   <img src="assets/tct_schemas.gif" alt="TCT Schema Comparison" width="700">
 </p>
 
-| Schema | TCT Vocab | UTF8 Vocab | Reduction | Context |
+| Schema | TCT Vocab | BPE Vocab | Reduction | Context |
 |--------|-----------|------------|-----------|---------|
 | Kubernetes | 1,000 | 1,527 | 35% | 2048 |
 | ESLint | 500 | 717 | 30% | 2048 |
@@ -133,7 +133,7 @@ bash scripts/train.sh kubernetes mini
 # Train multiple schemas
 bash scripts/train.sh kubernetes tsconfig eslintrc mini
 
-# Train both tokenizers (TCT and UTF8)
+# Train both tokenizers (TCT and BPE)
 bash scripts/train.sh kubernetes mini  # runs both by default
 
 # Train only TCT
@@ -163,7 +163,7 @@ bash scripts/eval.sh kubernetes mini --samples=100 --gen_samples=100
 python -m scripts.eval_generation \
     --schema kubernetes \
     --tct_checkpoint checkpoints/kubernetes_tct_mini \
-    --utf8_checkpoint checkpoints/kubernetes_utf8_mini \
+    --bpe_checkpoint checkpoints/kubernetes_bpe_mini \
     --eval_generation \
     --num_samples 10 \
     --save_samples results/samples/
