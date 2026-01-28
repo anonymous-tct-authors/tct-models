@@ -15,9 +15,9 @@ COLORS = {
     'utf8': '#f0883e',
     'box_bg': '#21262d',
     'border': '#30363d',
-    'kubernetes': '#326ce5',
-    'tsconfig': '#3178c6',
-    'eslint': '#4b32c3',
+    'kubernetes': '#326ce5',  # Kubernetes blue
+    'tsconfig': '#3fb950',    # Green
+    'eslint': '#a371f7',      # Purple
 }
 
 
