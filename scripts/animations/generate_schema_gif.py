@@ -174,7 +174,7 @@ def generate_animation(output_path: str, width: int = 700, height: int = 350):
 
 def main():
     parser = argparse.ArgumentParser(description="Generate schema comparison GIF")
-    parser.add_argument("--output", "-o", type=str, default="tct_schemas.gif")
+    parser.add_argument("--output", "-o", type=str, default="../../assets/tct_schemas.gif")
     parser.add_argument("--width", type=int, default=700)
     parser.add_argument("--height", type=int, default=300)
     args = parser.parse_args()

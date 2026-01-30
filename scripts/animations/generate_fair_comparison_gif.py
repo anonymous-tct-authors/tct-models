@@ -179,7 +179,7 @@ def generate_animation(output_path: str, width: int = 700, height: int = 380):
 
 def main():
     parser = argparse.ArgumentParser(description="Generate fair TCT comparison GIF")
-    parser.add_argument("--output", "-o", type=str, default="tct_comparison.gif")
+    parser.add_argument("--output", "-o", type=str, default="../../assets/tct_comparison.gif")
     args = parser.parse_args()
 
     num_frames = generate_animation(args.output)

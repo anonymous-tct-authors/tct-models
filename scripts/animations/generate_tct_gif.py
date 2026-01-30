@@ -368,7 +368,7 @@ def main():
     parser = argparse.ArgumentParser(description="Generate TCT animation GIF")
     parser.add_argument("--json", type=str, default='{"apiVersion": "v1", "kind": "Pod"}',
                         help="JSON string to tokenize")
-    parser.add_argument("--output", "-o", type=str, default="tct_animation.gif",
+    parser.add_argument("--output", "-o", type=str, default="../../assets/tct_animation.gif",
                         help="Output GIF file")
     parser.add_argument("--width", type=int, default=700, help="GIF width")
     parser.add_argument("--height", type=int, default=350, help="GIF height")

@@ -227,7 +227,7 @@ def generate_animation(output_path: str, width: int = 750, height: int = 380):
 
 def main():
     parser = argparse.ArgumentParser(description="Generate zero-entropy elimination GIF")
-    parser.add_argument("--output", "-o", type=str, default="tct_zero_entropy.gif")
+    parser.add_argument("--output", "-o", type=str, default="../../assets/tct_zero_entropy.gif")
     parser.add_argument("--width", type=int, default=750)
     parser.add_argument("--height", type=int, default=380)
     args = parser.parse_args()

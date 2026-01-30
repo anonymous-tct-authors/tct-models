@@ -208,3 +208,11 @@ __marimo__/
 
 # Model checkpoints (hosted on Hugging Face)
 checkpoints/
+
+# Extracted data directories (regenerate from .tar.xz files)
+data/eslintrc-tct-bpe-500/
+data/eslintrc-utf8-bpe-500/
+data/kubernetes-tct-bpe-1k/
+data/kubernetes-utf8-bpe-1k/
+data/tsconfig-tct-base/
+data/tsconfig-utf8-base-matched/

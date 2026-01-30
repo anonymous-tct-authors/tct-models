@@ -198,7 +198,7 @@ def main():
     parser.add_argument("--json", type=str,
                         default='{"apiVersion": "v1", "kind": "Pod", "metadata": {"name": "nginx"}}',
                         help="JSON string to tokenize")
-    parser.add_argument("--output", "-o", type=str, default="tct_comparison.gif",
+    parser.add_argument("--output", "-o", type=str, default="../../assets/tct_comparison.gif",
                         help="Output GIF file")
     parser.add_argument("--width", type=int, default=700, help="GIF width")
     parser.add_argument("--height", type=int, default=350, help="GIF height")
