@@ -42,7 +42,7 @@ SCHEMA_CONFIGS = {
     "tsconfig": {
         # Context: 2048 covers all sequences (P99=1108)
         "context_size": 2048,
-        "default_epochs": 150,  # Uniform epochs for fair comparison (best.pt for early stopping)
+        "default_epochs": 100,  # Base: tiny/mini/base ×1.5=150 epochs; small/medium/large =100 epochs
 
         # Vocabulary sizes (includes pad token)
         "tct_vocab_size": 258,      # Base encoding (257) + pad
@@ -77,7 +77,7 @@ SCHEMA_CONFIGS = {
     "eslintrc": {
         # Context: 2048 covers all sequences (P99=1858)
         "context_size": 2048,
-        "default_epochs": 150,  # Uniform epochs for fair comparison (best.pt for early stopping)
+        "default_epochs": 100,  # Base: tiny/mini/base ×1.5=150 epochs; small/medium/large =100 epochs
 
         # Vocabulary sizes (includes pad token)
         "tct_vocab_size": 500,      # BPE-500 (499) + pad
@@ -112,7 +112,7 @@ SCHEMA_CONFIGS = {
     "kubernetes": {
         # Context: 2048 covers 97.3% of sequences (P95=1006)
         "context_size": 2048,
-        "default_epochs": 150,  # Uniform epochs for fair comparison (best.pt for early stopping)
+        "default_epochs": 100,  # Base: tiny/mini/base ×1.5=150 epochs; small/medium/large =100 epochs
 
         # Vocabulary sizes (includes pad token)
         "tct_vocab_size": 1000,     # BPE-1k (999) + pad

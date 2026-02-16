@@ -108,9 +108,9 @@ echo "GPU: $GPU_NAME (${GPU_MEM}GB) - batch sizes auto-scaled"
 # =============================================================================
 
 get_epochs() {
-    # Uniform 150 epochs for all schemas (simpler, allows fair comparison)
-    # best.pt captures peak performance via early stopping
-    echo 150
+    # Base epoch count: tiny/mini/base multiply by 1.5 → 150 epochs;
+    # small/medium/large use this directly → 100 epochs
+    echo 100
 }
 
 # Default sizes for full experiment suite (can override with explicit size args)
