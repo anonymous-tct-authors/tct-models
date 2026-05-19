@@ -269,7 +269,7 @@ def compile_json_schema_grammar(
 # Schema directory (relative to this file's location)
 def _get_schema_dir() -> Path:
     """Get the schemas directory relative to this file."""
-    # Relative to this file: nanochat-tct/nanochat/ -> nanochat-tct/schemas/
+    # Relative to this file: tct-models/nanochat/ -> tct-models/schemas/
     return Path(__file__).parent.parent / "schemas"
 
 

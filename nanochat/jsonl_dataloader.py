@@ -32,6 +32,18 @@ import torch
 from torch.utils.data import Dataset, DataLoader, IterableDataset
 
 
+def _validation_jsonl_path(data_dir: Path) -> Path:
+    """Return the validation split file, accepting TCT's explicit name."""
+    validate_path = data_dir / "validate.jsonl"
+    if validate_path.exists():
+        return validate_path
+    return data_dir / "validation.jsonl"
+
+
+def _split_jsonl_paths(data_dir: Path) -> List[Path]:
+    return [data_dir / "train.jsonl", _validation_jsonl_path(data_dir)]
+
+
 def _load_sequence_lengths(data_dir: Path) -> List[int]:
     """Load sequence lengths from all.jsonl without keeping full sequences in memory.
 
@@ -46,9 +58,8 @@ def _load_sequence_lengths(data_dir: Path) -> List[int]:
                 tokens = json.loads(line)
                 lengths.append(len(tokens))
     else:
-        # Fallback: combine train + validate
-        for jsonl_name in ["train.jsonl", "validate.jsonl"]:
-            jsonl_file = data_dir / jsonl_name
+        # Fallback: combine train + validation split.
+        for jsonl_file in _split_jsonl_paths(data_dir):
             if jsonl_file.exists():
                 with open(jsonl_file, 'r') as f:
                     for line in f:
@@ -59,7 +70,7 @@ def _load_sequence_lengths(data_dir: Path) -> List[int]:
 
 
 def _load_all_sequences(data_dir: Path) -> List[List[int]]:
-    """Load all sequences from all.jsonl (or train+validate fallback).
+    """Load all sequences from all.jsonl (or train+validation fallback).
 
     Returns list of token lists (not tensors) for memory efficiency during filtering.
     """
@@ -71,9 +82,8 @@ def _load_all_sequences(data_dir: Path) -> List[List[int]]:
             for line in f:
                 sequences.append(json.loads(line))
     else:
-        # Fallback: combine train + validate
-        for jsonl_name in ["train.jsonl", "validate.jsonl"]:
-            jsonl_file = data_dir / jsonl_name
+        # Fallback: combine train + validation split.
+        for jsonl_file in _split_jsonl_paths(data_dir):
             if jsonl_file.exists():
                 with open(jsonl_file, 'r') as f:
                     for line in f:
@@ -232,7 +242,7 @@ class JSONLDataset(Dataset):
         Initialize dataset from pre-encoded JSONL file.
 
         Args:
-            jsonl_file: Path to JSONL file (train.jsonl or validate.jsonl)
+            jsonl_file: Path to JSONL file (train.jsonl, validate.jsonl, or validation.jsonl)
             context_size: Maximum sequence length (truncate if longer, pad if shorter)
             pad_token_id: Token ID used for padding (should be vocab_size - 1)
             max_len: Filter out sequences longer than this (None = no filtering)
@@ -357,7 +367,7 @@ def create_reshuffled_dataloaders(
     This fixes the sequential split issue by reshuffling the entire dataset.
 
     Args:
-        data_dir: Directory containing train.jsonl and validate.jsonl
+        data_dir: Directory containing train.jsonl and validate.jsonl or validation.jsonl
         context_size: Sequence length
         batch_size: Batch size
         train_ratio: Fraction for training (default 0.95)
@@ -395,15 +405,14 @@ def create_reshuffled_dataloaders(
                 all_sequences.append(torch.tensor(tokens, dtype=torch.long))
         source = "all.jsonl"
     else:
-        # Fallback: combine train.jsonl and validate.jsonl
-        for jsonl_name in ["train.jsonl", "validate.jsonl"]:
-            jsonl_file = data_dir / jsonl_name
+        # Fallback: combine train.jsonl and the validation split.
+        for jsonl_file in _split_jsonl_paths(data_dir):
             if jsonl_file.exists():
                 with open(jsonl_file, 'r') as f:
                     for line in f:
                         tokens = json.loads(line)
                         all_sequences.append(torch.tensor(tokens, dtype=torch.long))
-        source = "train.jsonl + validate.jsonl"
+        source = "train.jsonl + validation split"
 
     if verbose:
         print(f"Loaded {len(all_sequences):,} total sequences from {data_dir.name} ({source})")
@@ -453,7 +462,7 @@ def create_reshuffled_dataloaders(
     if len(all_sequences) == 0:
         raise ValueError(
             f"No sequences loaded from {data_dir}. "
-            f"Expected 'all.jsonl' or 'train.jsonl'+'validate.jsonl' in {data_dir}. "
+            f"Expected 'all.jsonl' or 'train.jsonl' plus validate.jsonl/validation.jsonl in {data_dir}. "
             f"Files found: {list(data_dir.glob('*.jsonl'))}"
         )
 
@@ -561,7 +570,7 @@ def create_dataloader(
     Create DataLoader for pre-encoded JSONL sequences.
 
     Args:
-        data_dir: Directory containing train.jsonl and validate.jsonl
+        data_dir: Directory containing train.jsonl and validate.jsonl or validation.jsonl
         context_size: Sequence length (from schema config)
         batch_size: Batch size
         split: "train" or "val"/"validate"
@@ -589,7 +598,7 @@ def create_dataloader(
 
     # Normalize split name
     if split in ("val", "validate", "validation"):
-        jsonl_file = data_dir / "validate.jsonl"
+        jsonl_file = _validation_jsonl_path(data_dir)
         split_name = "validate"
     else:
         jsonl_file = data_dir / "train.jsonl"
